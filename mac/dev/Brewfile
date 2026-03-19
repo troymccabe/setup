@@ -56,6 +56,8 @@ brew "oniguruma"                 # PHP: mbstring extension
 brew "pkg-config"                # Lets the compiler locate all Homebrew libs
 brew "autoconf"                  # PHP: required to run buildconf before ./configure
 brew "automake"                  # PHP: required alongside autoconf
+brew "gmp"                       # PHP: gmp extension (arbitrary precision math)
+brew "libtool"                   # PHP: required by the build system alongside autoconf
 brew "re2c"                      # PHP: lexer generator (required at compile time)
 brew "zlib"                      # PHP: zlib/deflate extension
 
