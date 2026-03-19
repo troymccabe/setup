@@ -390,6 +390,7 @@ if ! $DRY_RUN; then
   else
     info "Downloading & installing latest Xcode (this will take a while)…"
     xcodes install --latest --experimental-unxip
+    echo 1 | xcodes select
     success "Xcode installed"
   fi
 else
