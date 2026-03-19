@@ -40,27 +40,38 @@ brew "tree"                      # Directory listing as a tree
 brew "xcodes"                    # Manage Xcode versions (CLI)
 brew "yq"                        # YAML processor
 
-# ── PHP & Ruby build dependencies (native extensions on Apple Silicon) ───────
-brew "bison"                     # PHP: parser generator (>= 3.0.0 required)
-brew "libyaml"                   # Ruby: psych (YAML) build dep
-brew "openssl@3"                 # Ruby + PHP: TLS/crypto
-brew "readline"                  # Ruby: readline extension build dep
-brew "bzip2"                     # PHP: bz2 extension
-brew "curl"                      # PHP: curl extension (system curl lacks flags)
-brew "icu4c"                     # PHP: intl extension (Unicode/locale support)
-brew "krb5"                      # PHP: Kerberos (used by curl + openssl)
-brew "libiconv"                  # PHP: iconv extension
-brew "libsodium"                 # PHP: sodium extension
-brew "libxml2"                   # PHP: xml/dom/simplexml extensions
-brew "libzip"                    # PHP: zip extension
-brew "oniguruma"                 # PHP: mbstring extension
-brew "pkg-config"                # Lets the compiler locate all Homebrew libs
-brew "autoconf"                  # PHP: required to run buildconf before ./configure
-brew "automake"                  # PHP: required alongside autoconf
-brew "gmp"                       # PHP: gmp extension (arbitrary precision math)
-brew "libtool"                   # PHP: required by the build system alongside autoconf
-brew "re2c"                      # PHP: lexer generator (required at compile time)
-brew "zlib"                      # PHP: zlib/deflate extension
+# ── Ruby build dependencies ──────────────────────────────────────────────────
+brew "libyaml"                   # psych (YAML) extension
+brew "openssl@3"                 # openssl extension (shared with PHP)
+brew "readline"                  # readline extension
+
+# ── PHP build tools (keg-only; prepended to PATH before mise compiles PHP) ───
+brew "autoconf"                  # buildconf / ./configure
+brew "automake"                  # required alongside autoconf
+brew "bison"                     # parser generator >= 3.0.0
+brew "libtool"                   # build system support (GNU libtoolize)
+brew "pkg-config"                # lets the compiler locate all Homebrew libs
+brew "re2c"                      # lexer generator, required at compile time
+
+# ── PHP extension dependencies ────────────────────────────────────────────────
+brew "bzip2"                     # bz2 extension
+brew "curl"                      # curl extension (system curl lacks required flags)
+brew "freetype"                  # GD font rendering
+brew "gd"                        # GD image processing (bundles jpeg, png, webp)
+brew "gmp"                       # gmp extension (arbitrary precision math)
+brew "icu4c"                     # intl extension (Unicode / locale support)
+brew "jpeg-turbo"                # GD JPEG support
+brew "krb5"                      # Kerberos (used by curl + openssl)
+brew "libiconv"                  # iconv extension
+brew "libpng"                    # GD PNG support
+brew "libsodium"                 # sodium extension
+brew "libtidy"                   # tidy extension (HTML cleanup)
+brew "libwebp"                   # GD WebP support
+brew "libxml2"                   # xml / dom / simplexml extensions
+brew "libzip"                    # zip extension
+brew "oniguruma"                 # mbstring extension
+brew "sqlite"                    # PDO SQLite
+brew "zlib"                      # zlib / deflate extension
 
 # ── Apps (Cask) ───────────────────────────────────────────────────────────────
 cask "1password"                 # 1Password password manager
