@@ -1,0 +1,52 @@
+# ==============================================================================
+# Brewfile — Mac Setup
+# Run with: brew bundle --file=Brewfile
+# Lock file (Brewfile.lock.json) is committed — versions are pinned.
+# To upgrade everything: brew bundle --file=Brewfile --force
+# ==============================================================================
+
+# ── Taps ──────────────────────────────────────────────────────────────────────
+tap "homebrew/cask-fonts"
+tap "mas-cli/tap"
+
+# ── Git ───────────────────────────────────────────────────────────────────────
+brew "gh"                        # GitHub CLI
+brew "git"                       # Git
+brew "git-lfs"                   # Git Large File Storage
+brew "git-credential-manager"    # Cross-platform Git credential storage
+
+# ── Shell / Prompt ────────────────────────────────────────────────────────────
+cask "font-fira-code"            # Fira Code (Nerd Font variant for Starship icons)
+brew "starship"                  # Cross-shell prompt
+
+# ── Browsers ──────────────────────────────────────────────────────────────────
+cask "firefox"
+cask "google-chrome"
+
+# ── Docker / Containers ───────────────────────────────────────────────────────
+cask "rancher"                   # Rancher Desktop (container runtime)
+brew "docker-compose"            # Docker Compose plugin
+brew "docker-credential-helper"  # Credential helper for Docker registries
+
+# ── CLI Tools ─────────────────────────────────────────────────────────────────
+brew "aria2"                     # Lightweight multi-protocol download utility
+brew "gradle"                    # Build automation (JVM)
+brew "imagemagick"               # Image processing
+brew "jq"                        # JSON processor
+brew "mise"                      # Runtime version manager (node, python, ruby, etc.)
+brew "syft"                      # SBOM generator
+brew "telnet"                    # Telnet client
+brew "tree"                      # Directory listing as a tree
+brew "xcodes"                    # Manage Xcode versions (CLI)
+brew "yq"                        # YAML processor
+
+# ── Apps (Cask) ───────────────────────────────────────────────────────────────
+cask "1password"                 # 1Password password manager
+cask "jetbrains-toolbox"         # JetBrains IDE manager
+cask "bruno"                     # API client (open-source Postman alternative)
+cask "spotify"                   # Music streaming
+cask "xcodes"                    # Xcode version manager (GUI)
+
+# ── App Store (mas) ───────────────────────────────────────────────────────────
+mas "Magnet",         id: 441258766   # Window manager
+mas "Pixelmator Pro", id: 1289583905  # Image editor

@@ -1,0 +1,625 @@
+#!/usr/bin/env bash
+# ==============================================================================
+# setup.sh — Fresh Mac Bootstrap (macOS Tahoe)
+#
+# Usage:
+#   Normal:   chmod +x setup.sh && ./setup.sh
+#   Dry run:  ./setup.sh --dry-run
+# ==============================================================================
+
+set -euo pipefail
+
+# ── Dry-run flag ──────────────────────────────────────────────────────────────
+DRY_RUN=false
+[[ "${1:-}" == "--dry-run" ]] && DRY_RUN=true
+
+# run <cmd> [args…]
+#   In dry-run mode: print the command instead of executing it.
+#   In normal mode:  execute it.
+run() {
+  if $DRY_RUN; then
+    echo "  [dry-run] $*"
+  else
+    "$@"
+  fi
+}
+
+# ── Colours ───────────────────────────────────────────────────────────────────
+BOLD='\033[1m'
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+CYAN='\033[0;36m'
+RESET='\033[0m'
+
+info()    { echo -e "${CYAN}  ➜  $*${RESET}"; }
+success() { echo -e "${GREEN}  ✓  $*${RESET}"; }
+warn()    { echo -e "${YELLOW}  ⚠  $*${RESET}"; }
+header()  { echo -e "\n${BOLD}$*${RESET}"; }
+
+if $DRY_RUN; then
+  warn "DRY-RUN mode — no changes will be made"
+fi
+
+# ── Preflight ─────────────────────────────────────────────────────────────────
+header "🖥  Mac Setup — Starting"
+
+if ! $DRY_RUN; then
+  # Keep sudo alive for the duration of the script
+  sudo -v
+  while true; do sudo -n true; sleep 60; kill -0 "$$" || exit; done 2>/dev/null &
+fi
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# ==============================================================================
+# 1. COMPUTER NAME
+# ==============================================================================
+header "1 / 11  Computer name"
+
+if $DRY_RUN; then
+  echo "  [dry-run] prompt for computer name and set via scutil"
+else
+  printf '  Enter a name for this Mac (e.g. troys-mbp): '
+  read -r COMPUTER_NAME </dev/tty
+
+  if [[ -z "$COMPUTER_NAME" ]]; then
+    warn "No name entered — skipping computer name configuration"
+  else
+    sudo scutil --set ComputerName  "$COMPUTER_NAME"
+    sudo scutil --set LocalHostName "$COMPUTER_NAME"
+    sudo scutil --set HostName      "$COMPUTER_NAME"
+    success "Computer name set to: $COMPUTER_NAME"
+  fi
+fi
+
+
+# ==============================================================================
+# 1. XCODE COMMAND LINE TOOLS
+# ==============================================================================
+header "2 / 11  Xcode Command Line Tools"
+if xcode-select -p &>/dev/null; then
+  success "Already installed — skipping"
+else
+  info "Installing Xcode Command Line Tools…"
+  run xcode-select --install
+  if ! $DRY_RUN; then
+    until xcode-select -p &>/dev/null; do sleep 5; done
+  fi
+  success "Installed"
+fi
+
+# ==============================================================================
+# 2. HOMEBREW
+# ==============================================================================
+header "3 / 11  Homebrew"
+if command -v brew &>/dev/null; then
+  success "Already installed — running update"
+  run brew update
+else
+  info "Installing Homebrew…"
+  run /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+  if [[ -f /opt/homebrew/bin/brew ]]; then
+    eval "$(/opt/homebrew/bin/brew shellenv)"
+  fi
+  success "Homebrew installed"
+fi
+
+# Ensure brew is on PATH for the rest of the script (Apple Silicon)
+if [[ -f /opt/homebrew/bin/brew ]]; then
+  eval "$(/opt/homebrew/bin/brew shellenv)"
+fi
+
+# ==============================================================================
+# 3. APP STORE (mas) — sign-in required before brew bundle
+# ==============================================================================
+header "4 / 11  App Store"
+if ! command -v mas &>/dev/null; then
+  info "Installing mas…"
+  run brew install mas
+fi
+if ! $DRY_RUN && ! mas account &>/dev/null; then
+  warn "Not signed in to the App Store."
+  warn "Please open the App Store app, sign in, then press Enter to continue."
+  read -r -p "  Press Enter once signed in… " </dev/tty
+fi
+success "App Store session active"
+
+# ==============================================================================
+# 4. BREWFILE
+# ==============================================================================
+header "5 / 11  Brewfile"
+BREWFILE="$SCRIPT_DIR/Brewfile"
+if [[ ! -f "$BREWFILE" ]]; then
+  warn "Brewfile not found at $BREWFILE — make sure it is alongside this script."
+  exit 1
+fi
+
+# brew bundle check exits 0 if everything is already satisfied — skip the
+# install pass entirely on re-runs where nothing has changed.
+if ! $DRY_RUN && brew bundle check --file="$BREWFILE" &>/dev/null; then
+  success "All Brewfile packages already satisfied — skipping bundle install"
+else
+  info "Running brew bundle…"
+  # Omit --no-lock so Brewfile.lock.json is written/updated and can be committed.
+  run brew bundle --file="$BREWFILE"
+  success "All Homebrew packages installed"
+fi
+
+# ==============================================================================
+# 5. DIRECTORIES & ZSH CONFIG
+# ==============================================================================
+header "6 / 11  Directories & shell config"
+
+run mkdir -p "$HOME/Developer"
+run mkdir -p "$HOME/.config/zsh"
+run mkdir -p "$HOME/Pictures/Screenshots"
+success "Directories ready: ~/Developer  ~/.config/zsh  ~/Pictures/Screenshots"
+
+# Ensure ~/.zshrc exists
+run touch "$HOME/.zshrc"
+
+# ── Homebrew shellenv (idempotent) ────────────────────────────────────────────
+if ! grep -qF "brew shellenv" "$HOME/.zshrc"; then
+  if $DRY_RUN; then
+    echo "  [dry-run] append brew shellenv to ~/.zshrc"
+  else
+    cat >> "$HOME/.zshrc" <<'ZSHEOF'
+
+# Homebrew
+eval "$(/opt/homebrew/bin/brew shellenv)"
+ZSHEOF
+  fi
+  info "brew shellenv added to ~/.zshrc"
+fi
+
+# ── Source ~/.config/zsh/*.conf fragments (idempotent) ───────────────────────
+if ! grep -qF ".config/zsh" "$HOME/.zshrc"; then
+  if $DRY_RUN; then
+    echo "  [dry-run] append .config/zsh conf loader to ~/.zshrc"
+  else
+    cat >> "$HOME/.zshrc" <<'ZSHEOF'
+
+# Load modular zsh config fragments
+for file in ~/.config/zsh/*.conf; do source "$file"; done
+ZSHEOF
+  fi
+  info "conf fragment loader added to ~/.zshrc"
+fi
+
+# ── ~/.config/zsh/colors.conf ─────────────────────────────────────────────────
+if $DRY_RUN; then
+  echo "  [dry-run] write ~/.config/zsh/colors.conf"
+else
+  echo 'export CLICOLOR=1' > "$HOME/.config/zsh/colors.conf"
+fi
+success "~/.config/zsh/colors.conf written"
+
+# ── ~/.config/zsh/starship.conf ───────────────────────────────────────────────
+if $DRY_RUN; then
+  echo "  [dry-run] write ~/.config/zsh/starship.conf"
+else
+  cat > "$HOME/.config/zsh/starship.conf" <<'CONFEOF'
+# Starship cross-shell prompt
+# https://starship.rs/guide/#step-2-set-up-your-shell-to-use-starship
+eval "$(starship init zsh)"
+CONFEOF
+fi
+success "~/.config/zsh/starship.conf written"
+
+# ── ~/.config/zsh/mise.conf ───────────────────────────────────────────────────
+if $DRY_RUN; then
+  echo "  [dry-run] write ~/.config/zsh/mise.conf"
+else
+  cat > "$HOME/.config/zsh/mise.conf" <<'CONFEOF'
+# mise runtime version manager
+# https://mise.jdx.dev/getting-started.html
+eval "$(mise activate zsh)"
+CONFEOF
+fi
+success "~/.config/zsh/mise.conf written"
+
+# ==============================================================================
+# 6. GIT & GITHUB
+# ==============================================================================
+header "7 / 11  Git & GitHub"
+
+info "Initialising Git LFS…"
+# --skip-repo is safe to call outside a git working tree
+run git lfs install --skip-repo
+success "Git LFS ready"
+
+info "Configuring Git globals…"
+run git config --global user.name  "troymccabe"
+run git config --global user.email "troymccabe@gmail.com"
+run git config --global pull.rebase false
+success "Git globals set"
+
+info "Configuring Git Credential Manager…"
+if command -v git-credential-manager &>/dev/null; then
+  run git-credential-manager configure
+  success "GCM configured"
+fi
+
+# gh auth login is interactive — skip if a token already exists.
+if ! $DRY_RUN && ! gh auth status &>/dev/null; then
+  info "GitHub CLI — authenticating (browser will open)…"
+  gh auth login </dev/tty
+elif $DRY_RUN; then
+  echo "  [dry-run] gh auth login (skipped — interactive)"
+else
+  info "gh already authenticated — skipping login"
+fi
+run gh config set editor vi
+success "gh configured (editor: vi)"
+
+# ==============================================================================
+# 7. MISE — RUNTIMES & LANGUAGE TOOLING
+# ==============================================================================
+header "8 / 11  Runtime versions via mise"
+
+# Activate mise in the current shell so installed runtimes are immediately
+# available to the commands that follow (e.g. dotnet, cargo, gem, npm).
+# Failures here are non-fatal — the shell may not be fully interactive.
+eval "$(mise activate bash)" 2>/dev/null || true
+
+# Pin to known-good major versions. Individual projects can override via
+# .mise.toml in their repo root. Update these lines to bump globals.
+declare -A MISE_VERSIONS=(
+  [dotnet]="9"
+  [go]="1.23"
+  [node]="22"      # LTS
+  [python]="3.13"
+  [ruby]="3.3"
+  [rust]="stable"
+)
+
+for runtime in dotnet go node python ruby rust; do
+  version="${MISE_VERSIONS[$runtime]}"
+  if ! $DRY_RUN && mise current "$runtime" &>/dev/null; then
+    info "$runtime already installed — ensuring version ${version}…"
+  else
+    info "Installing $runtime ${version}…"
+  fi
+  run mise use --global "${runtime}@${version}"
+  success "$runtime ${version} ready"
+done
+
+# Re-activate so the PATH shims for newly installed runtimes are live
+eval "$(mise activate bash)" 2>/dev/null || true
+hash -r 2>/dev/null || true
+
+# ── .NET ──────────────────────────────────────────────────────────────────────
+# dotnet dev-certs is idempotent — it no-ops if a trusted cert already exists.
+info "Trusting .NET HTTPS development certificate…"
+run dotnet dev-certs https --verbose --trust
+
+# dotnet.conf — all env vars computed at shell-startup time via command
+# substitution, so they track whichever dotnet version mise has active.
+if $DRY_RUN; then
+  echo "  [dry-run] write ~/.config/zsh/dotnet.conf"
+else
+  cat > "$HOME/.config/zsh/dotnet.conf" <<'CONFEOF'
+# .NET SDK — managed by mise
+# https://learn.microsoft.com/en-us/dotnet/core/tools/dotnet-environment-variables
+#
+# Values are computed at shell-startup time — no manual update needed after
+# `mise use --global dotnet@x.y`.
+export PATH="$PATH:$HOME/.dotnet/tools"
+export DOTNET_ROOT="$(dirname "$(mise which dotnet 2>/dev/null)")"
+export DOTNET_VERSION="$(dotnet --version 2>/dev/null)"
+# MSBuildSDKsPath depends on the two vars above — must come last.
+export MSBuildSDKsPath="${DOTNET_ROOT}/sdk/${DOTNET_VERSION}/Sdks"
+CONFEOF
+fi
+success "~/.config/zsh/dotnet.conf written"
+
+# ── Go ────────────────────────────────────────────────────────────────────────
+# `mise which go` → …/bin/go  →  dirname ×2 → the Go root (not the bin dir)
+if $DRY_RUN; then
+  echo "  [dry-run] write ~/.config/zsh/go.conf"
+else
+  cat > "$HOME/.config/zsh/go.conf" <<'CONFEOF'
+# Go — managed by mise
+# https://go.dev/doc/install/source#environment
+#
+# GOROOT is computed at shell-startup time — no manual update needed after
+# `mise use --global go@x.y`.
+# mise which go  →  .../versions/go/1.x.y/bin/go
+# dirname once   →  .../versions/go/1.x.y/bin
+# dirname twice  →  .../versions/go/1.x.y          ← correct GOROOT
+export GOROOT="$(dirname "$(dirname "$(mise which go 2>/dev/null)")")"
+export PATH="${PATH}:${GOROOT}/bin"
+CONFEOF
+fi
+success "~/.config/zsh/go.conf written"
+
+# ── Node — global packages ────────────────────────────────────────────────────
+if ! $DRY_RUN && npm list -g yarn &>/dev/null; then
+  info "yarn already installed globally — skipping"
+else
+  info "Installing yarn globally…"
+  run npm install -g yarn
+  success "yarn installed"
+fi
+
+# ── Ruby — CocoaPods ─────────────────────────────────────────────────────────
+if ! $DRY_RUN && gem list cocoapods -i &>/dev/null; then
+  info "cocoapods already installed — skipping"
+else
+  info "Installing cocoapods…"
+  run gem install cocoapods
+  success "cocoapods installed"
+fi
+
+# ── Rust — cargo-edit ─────────────────────────────────────────────────────────
+if ! $DRY_RUN && cargo install --list 2>/dev/null | grep -q "^cargo-edit "; then
+  info "cargo-edit already installed — skipping"
+else
+  info "Installing cargo-edit…"
+  run cargo install cargo-edit
+  success "cargo-edit installed"
+fi
+
+# ==============================================================================
+# 8. XCODE FULL IDE
+# ==============================================================================
+header "9 / 11  Xcode"
+
+# Let xcodes resolve the latest stable version label, then check whether it is
+# already present before kicking off a multi-GB download.
+if ! $DRY_RUN; then
+  LATEST_XCODE="$(xcodes list 2>/dev/null \
+    | grep -v -E 'Beta|RC|\(Installed\)' \
+    | awk '{print $1}' \
+    | tail -1)"
+
+  if [[ -n "$LATEST_XCODE" ]] && xcodes list --installed 2>/dev/null | grep -qF "$LATEST_XCODE"; then
+    success "Xcode $LATEST_XCODE already installed — skipping download"
+  else
+    info "Downloading & installing latest Xcode (this will take a while)…"
+    xcodes install --latest --experimental-unxip
+    success "Xcode installed"
+  fi
+else
+  echo "  [dry-run] xcodes install --latest --experimental-unxip"
+fi
+
+info "Accepting Xcode license…"
+run sudo xcodebuild -license accept
+success "Xcode license accepted"
+
+# ==============================================================================
+# 9. macOS DEFAULTS (macOS Tahoe)
+# ==============================================================================
+header "10 / 11  macOS system defaults"
+
+# ────────────────────────────────────────────────────────────────────────────
+# DOCK
+# ────────────────────────────────────────────────────────────────────────────
+
+# https://developer.apple.com/documentation/devicemanagement/dock
+# Auto-hide the Dock
+run defaults write com.apple.dock autohide -bool true
+
+# https://developer.apple.com/documentation/devicemanagement/dock
+# Do not show recently used apps in the Dock
+run defaults write com.apple.dock show-recents -bool false
+
+# https://developer.apple.com/documentation/devicemanagement/dock
+# Dock icon tile size (pixels)
+run defaults write com.apple.dock tilesize -int 36
+
+# Remove all pinned apps and folder stacks from the Dock
+# (No Apple MDM key; established community method via direct plist write)
+run defaults write com.apple.dock persistent-apps  -array
+run defaults write com.apple.dock persistent-others -array
+
+success "Dock ✓"
+
+# ────────────────────────────────────────────────────────────────────────────
+# FINDER
+# ────────────────────────────────────────────────────────────────────────────
+
+# https://developer.apple.com/documentation/devicemanagement/finder
+# Show hidden files and folders
+run defaults write com.apple.finder AppleShowAllFiles -bool true
+
+# https://developer.apple.com/documentation/devicemanagement/finder
+# Show all filename extensions
+run defaults write NSGlobalDomain AppleShowAllExtensions -bool true
+
+# Disable the extension-change confirmation dialog
+# (No Apple MDM key; community method)
+run defaults write com.apple.finder FXEnableExtensionChangeWarning -bool false
+
+# https://developer.apple.com/documentation/devicemanagement/systempreferences
+# Default save target → local disk (not iCloud Drive)
+run defaults write NSGlobalDomain NSDocumentSaveNewDocumentsToCloud -bool false
+
+# Suppress .DS_Store creation on network volumes
+# (No Apple MDM key; community method)
+run defaults write com.apple.desktopservices DSDontWriteNetworkStores -bool true
+
+# Expand the Save panel by default
+# (No Apple MDM key; community method)
+run defaults write NSGlobalDomain NSNavPanelExpandedStateForSaveMode  -bool true
+run defaults write NSGlobalDomain NSNavPanelExpandedStateForSaveMode2 -bool true
+
+# Expand the Print panel by default
+# (No Apple MDM key; community method)
+run defaults write NSGlobalDomain PMPrintingExpandedStateForPrint  -bool true
+run defaults write NSGlobalDomain PMPrintingExpandedStateForPrint2 -bool true
+
+# Show the Finder status bar
+# (No Apple MDM key; community method)
+run defaults write com.apple.finder ShowStatusBar -bool true
+
+# Show the Finder path bar
+# (No Apple MDM key; community method)
+run defaults write com.apple.finder ShowPathbar -bool true
+
+# Unhide ~/Library
+# (chflags is the POSIX method; no defaults key covers this flag)
+run chflags nohidden "$HOME/Library"
+
+success "Finder ✓"
+
+# ────────────────────────────────────────────────────────────────────────────
+# MOUSE / TRACKPAD
+# ────────────────────────────────────────────────────────────────────────────
+
+# https://developer.apple.com/documentation/devicemanagement/mouse
+# Disable "natural" scroll direction for mice
+run defaults write NSGlobalDomain com.apple.swipescrolldirection -bool false
+
+success "Mouse ✓"
+
+# ────────────────────────────────────────────────────────────────────────────
+# SCREENSHOTS
+# ────────────────────────────────────────────────────────────────────────────
+
+# https://developer.apple.com/documentation/devicemanagement/screencapture
+# Default save location for keyboard-shortcut screenshots
+run defaults write com.apple.screencapture location -string "$HOME/Pictures/Screenshots"
+
+# Save location for iPhone Mirroring / Simulator captures
+# (No Apple MDM key; community method via screencapture plist)
+run defaults write com.apple.screencapture iosLocation -string "$HOME/Pictures/Screenshots"
+
+success "Screenshots ✓"
+
+# ────────────────────────────────────────────────────────────────────────────
+# TEXTEDIT
+# ────────────────────────────────────────────────────────────────────────────
+
+# Disable spell-checking while typing in TextEdit
+# (No Apple MDM key; community method)
+run defaults write com.apple.TextEdit CheckSpellingWhileTyping -bool false
+
+# https://developer.apple.com/documentation/devicemanagement/keyboard
+# Disable global auto-correct
+run defaults write NSGlobalDomain NSAutomaticSpellingCorrectionEnabled -bool false
+
+# Open new TextEdit documents as plain text (0 = RTF, 1 = plain text)
+# (No Apple MDM key; community method)
+run defaults write com.apple.TextEdit RichText -int 0
+
+# https://developer.apple.com/documentation/devicemanagement/keyboard
+# Disable smart copy/paste
+run defaults write NSGlobalDomain NSSmartCopyPaste -bool false
+
+# https://developer.apple.com/documentation/devicemanagement/keyboard
+# Disable smart/curly quotes
+run defaults write NSGlobalDomain NSAutomaticQuoteSubstitutionEnabled -bool false
+
+# https://developer.apple.com/documentation/devicemanagement/keyboard
+# Disable smart dashes (-- → —)
+run defaults write NSGlobalDomain NSAutomaticDashSubstitutionEnabled -bool false
+
+# https://developer.apple.com/documentation/devicemanagement/keyboard
+# Disable text replacement / substitutions
+run defaults write NSGlobalDomain NSAutomaticTextReplacementEnabled -bool false
+
+success "TextEdit ✓"
+
+# ────────────────────────────────────────────────────────────────────────────
+# XCODE
+# ────────────────────────────────────────────────────────────────────────────
+
+# Set DerivedData location to workspace-relative
+# IDEDerivedDataPathStyle: Default (global) | Relative | Absolute
+# (No Apple MDM key; community method via Xcode plist)
+run defaults write com.apple.dt.Xcode IDEDerivedDataPathStyle -string "Relative"
+
+# Route Simulator / iPhone Mirroring captures to the Screenshots folder
+# (No Apple MDM key; community method via iphonesimulator plist)
+run defaults write com.apple.iphonesimulator ScreenShotSaveLocation \
+  -string "$HOME/Pictures/Screenshots"
+
+success "Xcode defaults ✓"
+
+# ────────────────────────────────────────────────────────────────────────────
+# MISC
+# ────────────────────────────────────────────────────────────────────────────
+
+# https://developer.apple.com/documentation/devicemanagement/timeserver
+# Force 24-hour clock display system-wide
+run defaults write NSGlobalDomain AppleICUForce24HourTime -bool true
+
+# https://developer.apple.com/documentation/devicemanagement/appearance
+# Set interface appearance to Dark mode
+run defaults write NSGlobalDomain AppleInterfaceStyle -string "Dark"
+
+# Disable press-and-hold accent picker; enable key repeat instead
+# (No Apple MDM key; community method)
+run defaults write NSGlobalDomain ApplePressAndHoldEnabled -bool false
+
+success "Misc ✓"
+
+# ────────────────────────────────────────────────────────────────────────────
+# ACCOUNT — AVATAR & WALLPAPER
+# ────────────────────────────────────────────────────────────────────────────
+
+# Set the current user's profile picture.
+# dsimport is the supported way to write binary attributes (like JPEGPhoto)
+# into the local Open Directory node on macOS Tahoe.
+# (No Apple MDM key; community method)
+AVATAR="$SCRIPT_DIR/avatar.png"
+if [[ -f "$AVATAR" ]]; then
+  if $DRY_RUN; then
+    echo "  [dry-run] set profile picture from avatar.png"
+  else
+    # Build a dsimport-format record for the current user
+    AVATAR_TMPDIR="$(mktemp -d)"
+    AVATAR_DSIMPORT="$AVATAR_TMPDIR/avatar.dsimport"
+    # Write the dsimport header + base64-encoded image data
+    {
+      printf "0x0A 0x5C 0x3A 0x2C dsRecTypeStandard:Users 2 dsAttrTypeStandard:RecordName externalbinary:dsAttrTypeStandard:JPEGPhoto\n"
+      printf "%s:%s\n" "$USER" "$AVATAR"
+    } > "$AVATAR_DSIMPORT"
+    sudo dsimport "$AVATAR_DSIMPORT" /Local/Default M --recordtype dsRecTypeStandard:Users 2>/dev/null ||       warn "Profile picture import failed — you can set it manually in System Settings → Users & Groups"
+    rm -rf "$AVATAR_TMPDIR"
+    success "Profile picture set from avatar.png"
+  fi
+else
+  warn "avatar.png not found at $AVATAR — skipping profile picture"
+fi
+
+# Set the desktop wallpaper for the current user.
+# osascript is the most reliable cross-version method; System Events' wallpaper
+# property respects multiple spaces/monitors and survives Tahoe's sequoia-era
+# Sonoma wallpaper rework better than the older sqlite3 approach.
+# (No Apple MDM key; community method)
+WALLPAPER="$SCRIPT_DIR/wallpaper.png"
+if [[ -f "$WALLPAPER" ]]; then
+  run osascript -e "tell application \"System Events\" to tell every desktop to set picture to \"$WALLPAPER\""
+  success "Wallpaper set from wallpaper.png"
+else
+  warn "wallpaper.png not found at $WALLPAPER — skipping wallpaper"
+fi
+
+if ! $DRY_RUN; then
+  info "Restarting Dock, Finder, SystemUIServer…"
+  killall Dock            2>/dev/null || true
+  killall Finder          2>/dev/null || true
+  killall SystemUIServer  2>/dev/null || true
+  success "System services restarted"
+fi
+
+# ==============================================================================
+# 10. DONE
+# ==============================================================================
+header "11 / 11  All done 🎉"
+echo ""
+if $DRY_RUN; then
+  warn "This was a dry run — no changes were made. Remove --dry-run to apply."
+else
+  echo -e "  ${GREEN}Recommended next steps:${RESET}"
+  echo "  • Restart your Mac (required for all defaults to fully apply)"
+  echo "  • Open a new terminal — your prompt should now be Starship"
+  echo "  • Open Rancher Desktop and configure your container runtime"
+  echo "  • xcodes select    — select your active Xcode version"
+  echo "  • mise doctor      — verify all runtime installations"
+  echo "  • starship preset  — pick a Starship prompt theme"
+fi
+echo ""

@@ -1,0 +1,84 @@
+#!/usr/bin/env sh
+# ==============================================================================
+# bootstrap — Remote entry point for troymccabe/setup
+#
+# Usage (normal):
+#   curl -fsSL https://raw.githubusercontent.com/troymccabe/setup/main/mac/dev/bootstrap | sh
+#
+# Usage (dry run — previews what setup.sh would do, no changes made):
+#   curl -fsSL https://raw.githubusercontent.com/troymccabe/setup/main/mac/dev/bootstrap | sh -s -- --dry-run
+#
+# What this script does:
+#   1. Downloads Brewfile, setup, and SHA256SUMS from the repo
+#   2. Verifies file integrity via SHA-256 checksums
+#   3. Hands off to setup (re-attaching the TTY so interactive prompts work)
+# ==============================================================================
+
+set -eu
+
+REPO="troymccabe/setup"
+BRANCH="main"
+BASE_URL="https://raw.githubusercontent.com/${REPO}/${BRANCH}/mac/dev"
+WORK_DIR="${HOME}/.setup-bootstrap"
+
+# ── Colours (tput — available on every macOS without bash) ───────────────────
+_bold=$(tput bold   2>/dev/null || printf '')
+_green=$(tput setaf 2 2>/dev/null || printf '')
+_yellow=$(tput setaf 3 2>/dev/null || printf '')
+_cyan=$(tput setaf  6 2>/dev/null || printf '')
+_reset=$(tput sgr0  2>/dev/null || printf '')
+
+info()    { printf '%s  ➜  %s%s\n' "${_cyan}"   "$*" "${_reset}"; }
+success() { printf '%s  ✓  %s%s\n' "${_green}"  "$*" "${_reset}"; }
+warn()    { printf '%s  ⚠  %s%s\n' "${_yellow}" "$*" "${_reset}"; }
+header()  { printf '\n%s%s%s\n'    "${_bold}"    "$*" "${_reset}"; }
+die()     { printf '%s  ✖  %s%s\n' "${_yellow}"  "$*" "${_reset}" >&2; exit 1; }
+
+# ── Preflight ─────────────────────────────────────────────────────────────────
+header "🚀  Bootstrap — ${REPO}"
+
+command -v curl >/dev/null 2>&1 || die "curl is required but not installed."
+command -v shasum >/dev/null 2>&1 || die "shasum is required but not installed."
+
+# Work directory persists between runs — lets you re-run setup.sh directly
+# after a partial failure without re-downloading everything.
+mkdir -p "${WORK_DIR}"
+cd "${WORK_DIR}"
+
+# ── Download ──────────────────────────────────────────────────────────────────
+header "Downloading files…"
+
+for file in Brewfile setup SHA256SUMS avatar.png wallpaper.png; do
+  info "Fetching ${file}…"
+  # -f  fail loudly on HTTP errors (no silent 404 → garbage pipe)
+  # -s  suppress progress meter
+  # -S  show errors even with -s
+  # -L  follow redirects
+  curl -fsSL "${BASE_URL}/${file}" -o "${file}"
+  success "${file}"
+done
+
+# ── Verify checksums ──────────────────────────────────────────────────────────
+header "Verifying checksums…"
+
+# shasum --check honours lines in SHA256SUMS; --ignore-missing skips entries
+# not present locally (future-proofs against new files being added to the repo).
+if ! shasum -a 256 --check SHA256SUMS --ignore-missing; then
+  die "Checksum verification failed — the downloaded files may be corrupt or tampered with. Aborting."
+fi
+success "All checksums verified"
+
+# ── Hand off to setup.sh ──────────────────────────────────────────────────────
+chmod +x "${WORK_DIR}/setup"
+
+header "Launching setup…"
+info "Working directory: ${WORK_DIR}"
+info "(Re-run at any time with: bash ${WORK_DIR}/setup)"
+echo ""
+
+# Re-attach /dev/tty so that interactive prompts inside setup.sh (sudo,
+# gh auth login, App Store sign-in) receive keyboard input even though
+# this script was piped from curl.
+#
+# Pass through any arguments (e.g. --dry-run) to setup.sh.
+exec bash "${WORK_DIR}/setup" "$@" </dev/tty
