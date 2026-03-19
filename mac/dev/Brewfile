@@ -13,7 +13,7 @@ tap "microsoft/git"
 brew "gh"                        # GitHub CLI
 brew "git"                       # Git
 brew "git-lfs"                   # Git Large File Storage
-brew "git-credential-manager"    # Cross-platform Git credential storage
+cask "git-credential-manager"    # Cross-platform Git credential storage
 
 # ── Shell / Prompt ────────────────────────────────────────────────────────────
 cask "font-fira-code"            # Fira Code (Nerd Font variant for Starship icons)
@@ -45,7 +45,7 @@ cask "1password"                 # 1Password password manager
 cask "jetbrains-toolbox"         # JetBrains IDE manager
 cask "bruno"                     # API client (open-source Postman alternative)
 cask "spotify"                   # Music streaming
-cask "xcodes"                    # Xcode version manager (GUI)
+cask "xcodes-app"                    # Xcode version manager (GUI)
 
 # ── App Store (mas) ───────────────────────────────────────────────────────────
 mas "Magnet",         id: 441258766   # Window manager
