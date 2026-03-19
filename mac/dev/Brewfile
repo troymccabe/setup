@@ -65,12 +65,12 @@ brew "krb5"                      # Kerberos (used by curl + openssl)
 brew "libiconv"                  # iconv extension
 brew "libpng"                    # GD PNG support
 brew "libsodium"                 # sodium extension
-brew "libtidy"                   # tidy extension (HTML cleanup)
-brew "libwebp"                   # GD WebP support
 brew "libxml2"                   # xml / dom / simplexml extensions
 brew "libzip"                    # zip extension
 brew "oniguruma"                 # mbstring extension
 brew "sqlite"                    # PDO SQLite
+brew "tidy-html5"                # tidy extension (HTML cleanup)
+brew "webp"                      # GD WebP support
 brew "zlib"                      # zlib / deflate extension
 
 # ── Apps (Cask) ───────────────────────────────────────────────────────────────
