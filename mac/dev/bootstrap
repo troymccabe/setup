@@ -1,17 +1,17 @@
 #!/usr/bin/env sh
 # ==============================================================================
-# bootstrap — Remote entry point for troymccabe/setup
+# bootstrap.sh — Remote entry point for troymccabe/setup
 #
 # Usage (normal):
-#   curl -fsSL https://raw.githubusercontent.com/troymccabe/setup/main/mac/dev/bootstrap | sh
+#   curl -fsSL https://raw.githubusercontent.com/troymccabe/setup/main/bootstrap.sh | sh
 #
 # Usage (dry run — previews what setup.sh would do, no changes made):
-#   curl -fsSL https://raw.githubusercontent.com/troymccabe/setup/main/mac/dev/bootstrap | sh -s -- --dry-run
+#   curl -fsSL https://raw.githubusercontent.com/troymccabe/setup/main/bootstrap.sh | sh -s -- --dry-run
 #
 # What this script does:
-#   1. Downloads Brewfile, setup, and SHA256SUMS from the repo
+#   1. Downloads Brewfile, setup.sh, and SHA256SUMS from the repo
 #   2. Verifies file integrity via SHA-256 checksums
-#   3. Hands off to setup (re-attaching the TTY so interactive prompts work)
+#   3. Hands off to setup.sh (re-attaching the TTY so interactive prompts work)
 # ==============================================================================
 
 set -eu
@@ -48,7 +48,7 @@ cd "${WORK_DIR}"
 # ── Download ──────────────────────────────────────────────────────────────────
 header "Downloading files…"
 
-for file in Brewfile setup SHA256SUMS avatar.png wallpaper.png; do
+for file in Brewfile setup.sh SHA256SUMS avatar.png wallpaper.png; do
   info "Fetching ${file}…"
   # -f  fail loudly on HTTP errors (no silent 404 → garbage pipe)
   # -s  suppress progress meter
@@ -69,11 +69,11 @@ fi
 success "All checksums verified"
 
 # ── Hand off to setup.sh ──────────────────────────────────────────────────────
-chmod +x "${WORK_DIR}/setup"
+chmod +x "${WORK_DIR}/setup.sh"
 
-header "Launching setup…"
+header "Launching setup.sh…"
 info "Working directory: ${WORK_DIR}"
-info "(Re-run at any time with: bash ${WORK_DIR}/setup)"
+info "(Re-run at any time with: bash ${WORK_DIR}/setup.sh)"
 echo ""
 
 # Re-attach /dev/tty so that interactive prompts inside setup.sh (sudo,
@@ -81,4 +81,11 @@ echo ""
 # this script was piped from curl.
 #
 # Pass through any arguments (e.g. --dry-run) to setup.sh.
-exec bash "${WORK_DIR}/setup" "$@" </dev/tty
+# Prefer Homebrew bash 5 (if already installed) over the system bash 3.2.
+# On a completely fresh machine this will fall back to /bin/bash, which is
+# fine — the case statement in setup.sh is written for bash 3.2 compatibility.
+BASH_BIN="$(command -v bash)"
+for candidate in /opt/homebrew/bin/bash /usr/local/bin/bash; do
+  [ -x "$candidate" ] && BASH_BIN="$candidate" && break
+done
+exec "$BASH_BIN" "${WORK_DIR}/setup.sh" "$@" </dev/tty
