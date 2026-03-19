@@ -41,6 +41,7 @@ brew "xcodes"                    # Manage Xcode versions (CLI)
 brew "yq"                        # YAML processor
 
 # ── PHP & Ruby build dependencies (native extensions on Apple Silicon) ───────
+brew "bison"                     # PHP: parser generator (>= 3.0.0 required)
 brew "libyaml"                   # Ruby: psych (YAML) build dep
 brew "openssl@3"                 # Ruby + PHP: TLS/crypto
 brew "readline"                  # Ruby: readline extension build dep
