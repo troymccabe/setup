@@ -365,6 +365,10 @@ info "Installing PHP $(mise_version php) via mise…"
 if $DRY_RUN; then
   echo "  [dry-run] set PHP build flags and run: mise use --global php@$(mise_version php)"
 else
+  # autoconf/automake must be on PATH before the asdf-php plugin runs buildconf.
+  # Homebrew installs them keg-only on some versions, so force the prefix onto PATH.
+  export PATH="$(brew --prefix autoconf)/bin:$(brew --prefix automake)/bin:$PATH"
+
   PHP_BREW_DEPS="bzip2 libzip libxml2 icu4c zlib openssl@3 libiconv krb5 oniguruma libsodium curl"
 
   _ldflags=""
