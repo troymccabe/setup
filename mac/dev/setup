@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# setup.sh — Fresh Mac Bootstrap (macOS Tahoe)
+# setup — Fresh Mac Bootstrap (macOS Tahoe)
 #
 # Usage:
-#   Normal:   chmod +x setup.sh && ./setup.sh
-#   Dry run:  ./setup.sh --dry-run
+#   Normal:   chmod +x mac/dev/setup && mac/dev/setup
+#   Dry run:  ./setup --dry-run
 # ==============================================================================
 
 set -euo pipefail
