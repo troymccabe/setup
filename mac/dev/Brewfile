@@ -40,7 +40,22 @@ brew "tree"                      # Directory listing as a tree
 brew "xcodes"                    # Manage Xcode versions (CLI)
 brew "yq"                        # YAML processor
 
-# -- Ruby Build deps -----------------------------------------------------------
+# ── PHP build dependencies ─────────────────────────────────────────────────────
+brew "bzip2"
+brew "curl"
+brew "icu4c"
+brew "krb5"
+brew "libiconv"
+brew "libsodium"
+brew "libxml2"
+brew "libzip"
+brew "oniguruma"
+brew "openssl@3"
+brew "pkg-config"
+brew "re2c"
+brew "zlib"
+
+# -- Ruby Build dependencies ---------------------------------------------------
 brew "libyaml"
 
 # ── Apps (Cask) ───────────────────────────────────────────────────────────────
