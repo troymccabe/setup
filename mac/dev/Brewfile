@@ -40,6 +40,9 @@ brew "tree"                      # Directory listing as a tree
 brew "xcodes"                    # Manage Xcode versions (CLI)
 brew "yq"                        # YAML processor
 
+# -- Ruby Build deps -----------------------------------------------------------
+brew "libyaml"
+
 # ── Apps (Cask) ───────────────────────────────────────────────────────────────
 cask "1password"                 # 1Password password manager
 cask "jetbrains-toolbox"         # JetBrains IDE manager
