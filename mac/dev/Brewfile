@@ -82,7 +82,8 @@ cask "1password"                 # 1Password password manager
 cask "jetbrains-toolbox"         # JetBrains IDE manager
 cask "bruno"                     # API client (open-source Postman alternative)
 cask "spotify"                   # Music streaming
-cask "xcodes-app"                    # Xcode version manager (GUI)
+cask "visual-studio-code"        # Code editor
+cask "xcodes-app"                # Xcode version manager (GUI)
 
 # ── App Store (mas) ───────────────────────────────────────────────────────────
 mas "Magnet",         id: 441258766   # Window manager

@@ -354,7 +354,7 @@ else
   success "yarn installed"
 fi
 
-# ── Ruby — CocoaPods ─────────────────────────────────────────────────────────
+# ── Ruby — CocoaPods ──────────────────────────────────────────────────────────
 if ! $DRY_RUN && gem list cocoapods -i &>/dev/null; then
   info "cocoapods already installed — skipping"
 else
@@ -363,13 +363,20 @@ else
   success "cocoapods installed"
 fi
 
-# ── Rust — cargo-edit ─────────────────────────────────────────────────────────
+# ── Rust ──────────────────────────────────────────────────────────────────────
 if ! $DRY_RUN && cargo install --list 2>/dev/null | grep -q "^cargo-edit "; then
   info "cargo-edit already installed — skipping"
 else
   info "Installing cargo-edit…"
   run cargo install cargo-edit
   success "cargo-edit installed"
+fi
+if ! $DRY_RUN && cargo install --list 2>/dev/null | grep -q "^cargo-run "; then
+  info "cargo-run already installed — skipping"
+else
+  info "Installing cargo-run…"
+  run cargo install cargo-run
+  success "cargo-run installed"
 fi
 
 # ==============================================================================
@@ -476,6 +483,18 @@ run defaults write com.apple.finder ShowPathbar -bool true
 run chflags nohidden "$HOME/Library"
 
 success "Finder ✓"
+
+# ────────────────────────────────────────────────────────────────────────────
+# FINDER SIDEBAR
+# ────────────────────────────────────────────────────────────────────────────
+
+# Add favourite locations to the Finder sidebar.
+# sfltool (built-in) add-item is a no-op if the path is already present.
+for sidebar_dir in "$HOME/Developer" "$HOME" "$HOME/Pictures" "$HOME/Screenshots"; do
+  run sfltool add-item com.apple.LSSharedFileList.FavoriteItems "file://${sidebar_dir}/"
+done
+
+success "Finder sidebar ✓"
 
 # ────────────────────────────────────────────────────────────────────────────
 # MOUSE / TRACKPAD
