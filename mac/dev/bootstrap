@@ -1,12 +1,12 @@
 #!/usr/bin/env sh
 # ==============================================================================
-# bootstrap.sh — Remote entry point for troymccabe/setup
+# bootstrap — Remote entry point for troymccabe/setup
 #
 # Usage (normal):
-#   curl -fsSL https://raw.githubusercontent.com/troymccabe/setup/main/bootstrap.sh | sh
+#   curl -fsSL https://raw.githubusercontent.com/troymccabe/setup/main/mac/dev/bootstrap | sh
 #
 # Usage (dry run — previews what setup.sh would do, no changes made):
-#   curl -fsSL https://raw.githubusercontent.com/troymccabe/setup/main/bootstrap.sh | sh -s -- --dry-run
+#   curl -fsSL https://raw.githubusercontent.com/troymccabe/setup/main/mac/dev/bootstrap | sh -s -- --dry-run
 #
 # What this script does:
 #   1. Downloads Brewfile, setup.sh, and SHA256SUMS from the repo
@@ -69,18 +69,18 @@ fi
 success "All checksums verified"
 
 # ── Hand off to setup.sh ──────────────────────────────────────────────────────
-chmod +x "${WORK_DIR}/setup.sh"
+chmod +x "${WORK_DIR}/setup"
 
-header "Launching setup.sh…"
+header "Launching setup…"
 info "Working directory: ${WORK_DIR}"
-info "(Re-run at any time with: bash ${WORK_DIR}/setup.sh)"
+info "(Re-run at any time with: bash ${WORK_DIR}/setup)"
 echo ""
 
 # Re-attach /dev/tty so that interactive prompts inside setup.sh (sudo,
 # gh auth login, App Store sign-in) receive keyboard input even though
 # this script was piped from curl.
 #
-# Pass through any arguments (e.g. --dry-run) to setup.sh.
+# Pass through any arguments (e.g. --dry-run) to setup.
 # Prefer Homebrew bash 5 (if already installed) over the system bash 3.2.
 # On a completely fresh machine this will fall back to /bin/bash, which is
 # fine — the case statement in setup.sh is written for bash 3.2 compatibility.
@@ -88,4 +88,4 @@ BASH_BIN="$(command -v bash)"
 for candidate in /opt/homebrew/bin/bash /usr/local/bin/bash; do
   [ -x "$candidate" ] && BASH_BIN="$candidate" && break
 done
-exec "$BASH_BIN" "${WORK_DIR}/setup.sh" "$@" </dev/tty
+exec "$BASH_BIN" "${WORK_DIR}/setup" "$@" </dev/tty
