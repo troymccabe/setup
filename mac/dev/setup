@@ -59,11 +59,15 @@ header "1 / 11  Computer name"
 if $DRY_RUN; then
   echo "  [dry-run] prompt for computer name and set via scutil"
 else
-  printf '  Enter a name for this Mac (e.g. troys-mbp): '
+  CURRENT_NAME="$(scutil --get ComputerName 2>/dev/null || true)"
+  printf "  Enter a name for this Mac [${CURRENT_NAME}]: "
   read -r COMPUTER_NAME </dev/tty
 
+  # Use current name if the user just pressed Enter
+  COMPUTER_NAME="${COMPUTER_NAME:-$CURRENT_NAME}"
+
   if [[ -z "$COMPUTER_NAME" ]]; then
-    warn "No name entered — skipping computer name configuration"
+    warn "No name available — skipping computer name configuration"
   else
     sudo scutil --set ComputerName  "$COMPUTER_NAME"
     sudo scutil --set LocalHostName "$COMPUTER_NAME"
@@ -71,7 +75,6 @@ else
     success "Computer name set to: $COMPUTER_NAME"
   fi
 fi
-
 
 # ==============================================================================
 # 1. XCODE COMMAND LINE TOOLS
