@@ -272,12 +272,12 @@ eval "$(mise activate bash)" 2>/dev/null || true
 # which predates associative array support (bash 4+).
 mise_version() {
   case "$1" in
-    dotnet) echo "9"      ;;
-    go)     echo "1.23"   ;;
-    node)   echo "22"     ;;  # LTS
+    dotnet) echo "10"     ;;
+    go)     echo "1.26"   ;;
+    node)   echo "24"     ;;
     php)    echo "8.4"    ;;
     python) echo "3.13"   ;;
-    ruby)   echo "3.3"    ;;
+    ruby)   echo "3.4"    ;;
     rust)   echo "stable" ;;
   esac
 }
