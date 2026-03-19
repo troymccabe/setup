@@ -272,6 +272,7 @@ mise_version() {
     dotnet) echo "9"      ;;
     go)     echo "1.23"   ;;
     node)   echo "22"     ;;  # LTS
+    php)    echo "8.4"    ;;
     python) echo "3.13"   ;;
     ruby)   echo "3.3"    ;;
     rust)   echo "stable" ;;
@@ -355,6 +356,52 @@ else
   run gem install cocoapods
   success "cocoapods installed"
 fi
+
+# ── PHP ───────────────────────────────────────────────────────────────────────
+# PHP must be compiled with flags pointing at Homebrew libs in /opt/homebrew.
+# These are set inline (not exported to the permanent environment) to avoid
+# contaminating other build tools. PKG_CONFIG_PATH is the safe one to persist.
+info "Installing PHP $(mise_version php) via mise…"
+if $DRY_RUN; then
+  echo "  [dry-run] set PHP build flags and run: mise use --global php@$(mise_version php)"
+else
+  PHP_BREW_DEPS="bzip2 libzip libxml2 icu4c zlib openssl@3 libiconv krb5 oniguruma libsodium curl"
+
+  _ldflags=""
+  _cppflags=""
+  _pkg_config=""
+  for dep in $PHP_BREW_DEPS; do
+    prefix="$(brew --prefix "$dep" 2>/dev/null)" || continue
+    _ldflags="$_ldflags -L${prefix}/lib"
+    _cppflags="$_cppflags -I${prefix}/include"
+    _pkg_config="${_pkg_config}:${prefix}/lib/pkgconfig"
+  done
+  # Strip leading separators
+  _pkg_config="${_pkg_config#:}"
+
+  LDFLAGS="$_ldflags" \
+  CPPFLAGS="$_cppflags" \
+  PKG_CONFIG_PATH="$_pkg_config" \
+    mise use --global "php@$(mise_version php)"
+
+  # Write a permanent PKG_CONFIG_PATH conf so tools like pecl/composer can
+  # find Homebrew libs at runtime without needing the build-time LDFLAGS.
+  cat > "$HOME/.config/zsh/php.conf" <<'CONFEOF'
+# PHP — managed by mise
+# PKG_CONFIG_PATH lets pecl/composer locate Homebrew libs (safe to persist;
+# unlike LDFLAGS/CPPFLAGS this does not affect other compilers).
+_php_brew_deps="bzip2 libzip libxml2 icu4c zlib openssl@3 libiconv krb5 oniguruma libsodium curl"
+_php_pkg_config_path=""
+for _dep in $_php_brew_deps; do
+  _prefix="$(brew --prefix "$_dep" 2>/dev/null)" || continue
+  _php_pkg_config_path="${_php_pkg_config_path}:${_prefix}/lib/pkgconfig"
+done
+export PKG_CONFIG_PATH="${_php_pkg_config_path#:}${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
+unset _php_brew_deps _php_pkg_config_path _dep _prefix
+CONFEOF
+
+fi
+success "PHP $(mise_version php) ready"
 
 # ── Rust — cargo-edit ─────────────────────────────────────────────────────────
 if ! $DRY_RUN && cargo install --list 2>/dev/null | grep -q "^cargo-edit "; then
