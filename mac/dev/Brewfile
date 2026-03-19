@@ -38,6 +38,7 @@ brew "gradle"                    # Build automation (JVM)
 brew "imagemagick"               # Image processing
 brew "jq"                        # JSON processor
 brew "mise"                      # Runtime version manager (node, python, ruby, etc.)
+brew "mysides"                   # Manage Finder sidebar items
 brew "syft"                      # SBOM generator
 brew "telnet"                    # Telnet client
 brew "tree"                      # Directory listing as a tree

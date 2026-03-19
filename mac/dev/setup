@@ -488,11 +488,12 @@ success "Finder ✓"
 # FINDER SIDEBAR
 # ────────────────────────────────────────────────────────────────────────────
 
-# Add favourite locations to the Finder sidebar.
-# sfltool (built-in) add-item is a no-op if the path is already present.
-for sidebar_dir in "$HOME/Developer" "$HOME" "$HOME/Pictures" "$HOME/Screenshots"; do
-  run sfltool add-item com.apple.LSSharedFileList.FavoriteItems "file://${sidebar_dir}/"
-done
+# Add favourite locations to the Finder sidebar via mysides.
+# mysides add is idempotent — existing entries are replaced in-place.
+run mysides add "Developer"  "file://${HOME}/Developer/"
+run mysides add "Home"       "file://${HOME}/"
+run mysides add "Pictures"   "file://${HOME}/Pictures/"
+run mysides add "Screenshots" "file://${HOME}/Screenshots/"
 
 success "Finder sidebar ✓"
 
