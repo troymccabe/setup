@@ -264,17 +264,22 @@ eval "$(mise activate bash)" 2>/dev/null || true
 
 # Pin to known-good major versions. Individual projects can override via
 # .mise.toml in their repo root. Update these lines to bump globals.
-declare -A MISE_VERSIONS=(
-  [dotnet]="9"
-  [go]="1.23"
-  [node]="22"      # LTS
-  [python]="3.13"
-  [ruby]="3.3"
-  [rust]="stable"
-)
+#
+# Uses a case statement instead of an associative array — macOS ships bash 3.2
+# which predates associative array support (bash 4+).
+mise_version() {
+  case "$1" in
+    dotnet) echo "9"      ;;
+    go)     echo "1.23"   ;;
+    node)   echo "22"     ;;  # LTS
+    python) echo "3.13"   ;;
+    ruby)   echo "3.3"    ;;
+    rust)   echo "stable" ;;
+  esac
+}
 
 for runtime in dotnet go node python ruby rust; do
-  version="${MISE_VERSIONS[$runtime]}"
+  version="$(mise_version "$runtime")"
   if ! $DRY_RUN && mise current "$runtime" &>/dev/null; then
     info "$runtime already installed — ensuring version ${version}…"
   else
