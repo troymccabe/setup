@@ -1,0 +1,32 @@
+name: Update SHA256SUMS
+
+on:
+  push:
+    paths:
+      - "mac/dev/Brewfile"
+      - "mac/dev/setup"
+      - "mac/dev/avatar.png"
+      - "mac/dev/wallpaper.png"
+
+jobs:
+  update-sha256sums:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Recompute SHA256SUMS
+        working-directory: mac/dev
+        run: |
+          sha256sum Brewfile setup avatar.png wallpaper.png > SHA256SUMS
+
+      - name: Commit updated SHA256SUMS
+        working-directory: mac/dev
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add SHA256SUMS
+          git diff --cached --quiet || git commit -m "Update SHA256SUMS [skip ci]"
+          git push

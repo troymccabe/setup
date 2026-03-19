@@ -9,6 +9,9 @@
 tap "mas-cli/tap"
 tap "microsoft/git"
 
+# ── AI ───────────────────────────────────────────────────────────────────────
+cask "claude-code"               # Claude Code
+
 # ── Git ───────────────────────────────────────────────────────────────────────
 brew "gh"                        # GitHub CLI
 brew "git"                       # Git
@@ -20,6 +23,7 @@ cask "font-fira-code"            # Fira Code (Nerd Font variant for Starship ico
 brew "starship"                  # Cross-shell prompt
 
 # ── Browsers ──────────────────────────────────────────────────────────────────
+brew "defaultbrowser"            # Set the default browser from the CLI
 cask "firefox"
 cask "google-chrome"
 

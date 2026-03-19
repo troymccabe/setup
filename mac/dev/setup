@@ -282,12 +282,15 @@ mise_version() {
   esac
 }
 
-for runtime in dotnet go node python ruby rust; do
+for runtime in dotnet go node php python ruby rust; do
   version="$(mise_version "$runtime")"
   if ! $DRY_RUN && mise current "$runtime" &>/dev/null; then
     info "$runtime already installed — ensuring version ${version}…"
   else
     info "Installing $runtime ${version}…"
+  fi
+  if [[ "$runtime" == "php" ]]; then
+    export PHP_CONFIGURE_OPTIONS="--with-openssl=$(brew --prefix openssl@3) --with-iconv=$(brew --prefix libiconv) --with-libxml-dir=$(brew --prefix libxml2) --with-tidy=$(brew --prefix tidy-html5) --with-curl=$(brew --prefix curl) --with-zlib-dir=$(brew --prefix zlib) --with-zip --with-bz2=$(brew --prefix bzip2) --with-gmp=$(brew --prefix gmp) --with-sodium=$(brew --prefix libsodium) --enable-intl --enable-mbstring --enable-gd --with-jpeg=$(brew --prefix jpeg-turbo) --with-freetype=$(brew --prefix freetype) --with-webp=$(brew --prefix webp) --enable-sockets --enable-bcmath --enable-exif --with-pdo-sqlite --with-sqlite3"
   fi
   run mise use --global "${runtime}@${version}"
   success "$runtime ${version} ready"
@@ -359,68 +362,6 @@ else
   run gem install cocoapods
   success "cocoapods installed"
 fi
-
-# ── PHP ───────────────────────────────────────────────────────────────────────
-# PHP must be compiled with flags pointing at Homebrew libs in /opt/homebrew.
-# These are set inline (not exported to the permanent environment) to avoid
-# contaminating other build tools. PKG_CONFIG_PATH is the safe one to persist.
-info "Installing PHP $(mise_version php) via mise…"
-if $DRY_RUN; then
-  echo "  [dry-run] set PHP build flags and run: mise use --global php@$(mise_version php)"
-else
-  # autoconf/automake must be on PATH before the asdf-php plugin runs buildconf.
-  # Homebrew installs them keg-only on some versions, so force the prefix onto PATH.
-  export PATH="$(brew --prefix autoconf)/bin:$(brew --prefix automake)/bin:$(brew --prefix bison)/bin:$(brew --prefix libtool)/libexec/gnubin:$PATH"
-
-  PHP_BREW_DEPS="bzip2 curl freetype gmp icu4c jpeg-turbo krb5 libiconv libpng libsodium tidy-html5 webp libxml2 libzip oniguruma openssl@3 sqlite zlib"
-
-  _ldflags=""
-  _cppflags=""
-  _pkg_config=""
-  for dep in $PHP_BREW_DEPS; do
-    prefix="$(brew --prefix "$dep" 2>/dev/null)" || continue
-    _ldflags="$_ldflags -L${prefix}/lib"
-    _cppflags="$_cppflags -I${prefix}/include"
-    _pkg_config="${_pkg_config}:${prefix}/lib/pkgconfig"
-  done
-  # Strip leading separators
-  _pkg_config="${_pkg_config#:}"
-
-  OPENSSL_PREFIX="$(brew --prefix openssl@3)"
-  LIBICONV_PREFIX="$(brew --prefix libiconv)"
-  LIBXML2_PREFIX="$(brew --prefix libxml2)"
-  TIDY_PREFIX="$(brew --prefix tidy-html5)"
-
-  # PHP_BUILD_CONFIGURE_OPTS passes extra ./configure flags to the asdf-php
-  # plugin. --with-openssl must point explicitly at the Homebrew prefix because
-  # the system OpenSSL on macOS is too old and not in the default search path.
-  # Similarly, libiconv, libxml2, and tidy-html5 are keg-only and need explicit
-  # paths so the build system finds their headers rather than the system stubs.
-  export PHP_BUILD_CONFIGURE_OPTS="--with-openssl=${OPENSSL_PREFIX} --with-iconv=${LIBICONV_PREFIX} --with-libxml-dir=${LIBXML2_PREFIX} --with-tidy=${TIDY_PREFIX} --with-curl --with-zlib --with-zip --with-bz2 --with-gmp --with-sodium --enable-intl --enable-mbstring --enable-gd --with-jpeg --with-freetype --with-webp --enable-sockets --enable-bcmath --enable-exif --with-pdo-sqlite --with-sqlite3"
-
-  LDFLAGS="$_ldflags" \
-  CPPFLAGS="$_cppflags" \
-  PKG_CONFIG_PATH="$_pkg_config" \
-    mise use --global "php@$(mise_version php)"
-
-  # Write a permanent PKG_CONFIG_PATH conf so tools like pecl/composer can
-  # find Homebrew libs at runtime without needing the build-time LDFLAGS.
-  cat > "$HOME/.config/zsh/php.conf" <<'CONFEOF'
-# PHP — managed by mise
-# PKG_CONFIG_PATH lets pecl/composer locate Homebrew libs (safe to persist;
-# unlike LDFLAGS/CPPFLAGS this does not affect other compilers).
-_php_brew_deps="bzip2 curl freetype gmp icu4c jpeg-turbo krb5 libiconv libpng libsodium tidy-html5 webp libxml2 libzip oniguruma openssl@3 sqlite zlib"
-_php_pkg_config_path=""
-for _dep in $_php_brew_deps; do
-  _prefix="$(brew --prefix "$_dep" 2>/dev/null)" || continue
-  _php_pkg_config_path="${_php_pkg_config_path}:${_prefix}/lib/pkgconfig"
-done
-export PKG_CONFIG_PATH="${_php_pkg_config_path#:}${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
-unset _php_brew_deps _php_pkg_config_path _dep _prefix
-CONFEOF
-
-fi
-success "PHP $(mise_version php) ready"
 
 # ── Rust — cargo-edit ─────────────────────────────────────────────────────────
 if ! $DRY_RUN && cargo install --list 2>/dev/null | grep -q "^cargo-edit "; then
@@ -626,6 +567,19 @@ run defaults write NSGlobalDomain AppleInterfaceStyle -string "Dark"
 run defaults write NSGlobalDomain ApplePressAndHoldEnabled -bool false
 
 success "Misc ✓"
+
+# ────────────────────────────────────────────────────────────────────────────
+# DEFAULT BROWSER
+# ────────────────────────────────────────────────────────────────────────────
+
+# defaultbrowser (installed via Brewfile) sets the default browser from the CLI.
+# Running it the first time triggers a one-time macOS confirmation dialog.
+if command -v defaultbrowser &>/dev/null; then
+  run defaultbrowser firefox
+  success "Default browser set to Firefox"
+else
+  warn "defaultbrowser not found — skipping (install via: brew install defaultbrowser)"
+fi
 
 # ────────────────────────────────────────────────────────────────────────────
 # ACCOUNT — AVATAR & WALLPAPER
