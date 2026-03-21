@@ -22,6 +22,12 @@ cask "git-credential-manager"    # Cross-platform Git credential storage
 cask "font-fira-code"            # Fira Code (Nerd Font variant for Starship icons)
 brew "starship"                  # Cross-shell prompt
 
+# ── Chat apps ───────────────────────────────────────────────────────────────────────
+cask "discord"                   # Discord
+cask "microsoft-teams"           # Microsoft Teams
+cask "signal"                    # Signal
+cask "slack"                     # Slack
+
 # ── Browsers ──────────────────────────────────────────────────────────────────
 brew "defaultbrowser"            # Set the default browser from the CLI
 cask "firefox"
@@ -38,7 +44,6 @@ brew "gradle"                    # Build automation (JVM)
 brew "imagemagick"               # Image processing
 brew "jq"                        # JSON processor
 brew "mise"                      # Runtime version manager (node, python, ruby, etc.)
-brew "mysides"                   # Manage Finder sidebar items
 brew "syft"                      # SBOM generator
 brew "telnet"                    # Telnet client
 brew "tree"                      # Directory listing as a tree

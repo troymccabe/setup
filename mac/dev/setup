@@ -209,17 +209,19 @@ CONFEOF
 fi
 success "~/.config/zsh/starship.conf written"
 
-# ── ~/.config/zsh/mise.conf ───────────────────────────────────────────────────
+# ── ~/.config/zsh/00-mise.conf ────────────────────────────────────────────────
+# Named 00-* so it sorts first in the glob — language confs (dotnet, go, …)
+# invoke `mise which` / tool binaries and require mise to already be active.
 if $DRY_RUN; then
-  echo "  [dry-run] write ~/.config/zsh/mise.conf"
+  echo "  [dry-run] write ~/.config/zsh/00-mise.conf"
 else
-  cat > "$HOME/.config/zsh/mise.conf" <<'CONFEOF'
+  cat > "$HOME/.config/zsh/00-mise.conf" <<'CONFEOF'
 # mise runtime version manager
 # https://mise.jdx.dev/getting-started.html
 eval "$(mise activate zsh)"
 CONFEOF
 fi
-success "~/.config/zsh/mise.conf written"
+success "~/.config/zsh/00-mise.conf written"
 
 # ==============================================================================
 # 6. GIT & GITHUB
