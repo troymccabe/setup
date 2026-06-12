@@ -539,14 +539,49 @@ success "Finder ✓"
 # FINDER SIDEBAR
 # ────────────────────────────────────────────────────────────────────────────
 
-# Add favourite locations to the Finder sidebar via mysides.
-# mysides add is idempotent — existing entries are replaced in-place.
-run mysides add "Developer"  "file://${HOME}/Developer/"
-run mysides add "Home"       "file://${HOME}/"
-run mysides add "Pictures"   "file://${HOME}/Pictures/"
-run mysides add "Screenshots" "file://${HOME}/Pictures/Screenshots/"
+# Add favourite locations to the Finder sidebar via sbedit.
+# https://github.com/fabienconus/sidebar-editor — replaces the deprecated
+# mysides tool, which doesn't understand the sfl3/sfl4 file format used by
+# macOS Sonoma+ / Tahoe.
+#
+# sbedit isn't distributed via Homebrew. The upstream .pkg is unsigned
+# (verified 2026-06), so it offers no TCC benefit — we just build the
+# single-file Swift source ourselves with the Xcode CLI Tools that step
+# 2 already installed. Pinned to a commit SHA so the source tarball is
+# byte-stable.
+SBEDIT_COMMIT="e31d3406fd737231bade80609b8dc3400c535e48"  # tag 1.0
+SBEDIT_BIN="/usr/local/bin/sbedit"
 
-success "Finder sidebar ✓"
+if $DRY_RUN; then
+  echo "  [dry-run] build & install sbedit @ ${SBEDIT_COMMIT:0:7} → $SBEDIT_BIN"
+elif [[ ! -x "$SBEDIT_BIN" ]]; then
+  info "Building sbedit from source (commit ${SBEDIT_COMMIT:0:7})…"
+  sbedit_tmp="$(mktemp -d)"
+  (
+    cd "$sbedit_tmp"
+    curl -fsSL "https://github.com/fabienconus/sidebar-editor/archive/${SBEDIT_COMMIT}.tar.gz" | tar xz
+    cd "sidebar-editor-${SBEDIT_COMMIT}/sbedit"
+    xcrun -sdk macosx swiftc -O -o sbedit main.swift
+    sudo install -m 0755 sbedit "$SBEDIT_BIN"
+  )
+  rm -rf "$sbedit_tmp"
+  success "sbedit installed → $SBEDIT_BIN"
+fi
+
+if $DRY_RUN || [[ -x "$SBEDIT_BIN" ]]; then
+  run "$SBEDIT_BIN" --add \
+    "$HOME/Developer" \
+    "$HOME" \
+    "$HOME/Pictures" \
+    "$HOME/Pictures/Screenshots"
+  # `--reload --force` restarts Finder so the new entries appear immediately.
+  # The global Finder restart later in the script would also pick them up,
+  # but doing it inline keeps the sidebar block self-contained.
+  run "$SBEDIT_BIN" --reload --force
+  success "Finder sidebar ✓"
+else
+  warn "sbedit unavailable — skipping sidebar setup. Add favourites manually via Finder → drag folder to sidebar."
+fi
 
 # ────────────────────────────────────────────────────────────────────────────
 # MOUSE / TRACKPAD
