@@ -589,17 +589,40 @@ elif [[ ! -x "$SBEDIT_BIN" ]]; then
   success "sbedit installed → $SBEDIT_BIN"
 fi
 
-if $DRY_RUN || [[ -x "$SBEDIT_BIN" ]]; then
-  run "$SBEDIT_BIN" --add \
+if $DRY_RUN; then
+  echo "  [dry-run] sbedit --add ~/Developer ~ ~/Pictures ~/Pictures/Screenshots"
+  echo "  [dry-run] sbedit --reload --force"
+elif [[ -x "$SBEDIT_BIN" ]]; then
+  # Writing to ~/Library/Application Support/com.apple.sharedfilelist/ is
+  # TCC-protected on macOS Sonoma+. The terminal running this script needs
+  # Full Disk Access for sbedit to succeed — there is no programmatic way
+  # to grant it. Capture stderr so we can detect the TCC failure mode and
+  # surface a clear instruction without killing the whole run.
+  #
+  # `if cmd; then …; else rc=$?; fi` is the set-e-safe way to capture both
+  # output and exit code. A plain `var=$(cmd)` would exit under `set -e`
+  # before we could read $? on failure.
+  if sbedit_out=$("$SBEDIT_BIN" --add \
     "$HOME/Developer" \
     "$HOME" \
     "$HOME/Pictures" \
-    "$HOME/Pictures/Screenshots"
-  # `--reload --force` restarts Finder so the new entries appear immediately.
-  # The global Finder restart later in the script would also pick them up,
-  # but doing it inline keeps the sidebar block self-contained.
-  run "$SBEDIT_BIN" --reload --force
-  success "Finder sidebar ✓"
+    "$HOME/Pictures/Screenshots" 2>&1); then
+    sbedit_rc=0
+  else
+    sbedit_rc=$?
+  fi
+  if [[ $sbedit_rc -eq 0 ]] && ! echo "$sbedit_out" | grep -qiE 'operation not permitted|don.?t have permission'; then
+    # `--reload --force` restarts Finder so the new entries appear
+    # immediately. The global Finder restart later in the script would
+    # also pick them up, but doing it inline keeps the block self-contained.
+    "$SBEDIT_BIN" --reload --force >/dev/null 2>&1 || true
+    success "Finder sidebar ✓"
+  else
+    warn "sbedit blocked by macOS Full Disk Access protection."
+    warn "Grant FDA to your terminal app, then re-run setup:"
+    warn "  System Settings → Privacy & Security → Full Disk Access → + (your terminal)"
+    warn "Skipping sidebar entries for now — Finder favourites can also be added by drag-and-drop."
+  fi
 else
   warn "sbedit unavailable — skipping sidebar setup. Add favourites manually via Finder → drag folder to sidebar."
 fi

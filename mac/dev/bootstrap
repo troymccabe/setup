@@ -18,8 +18,15 @@ set -eu
 
 REPO="troymccabe/setup"
 BRANCH="main"
-BASE_URL="https://raw.githubusercontent.com/${REPO}/${BRANCH}/mac/dev"
 WORK_DIR="${HOME}/.setup-bootstrap"
+
+# BASE_URL is resolved below to a specific commit SHA so all downloads come
+# from a single, immutable snapshot. Fetching from `…/${BRANCH}/…` instead
+# would hit raw.githubusercontent.com's CDN cache (~5 min per URL) and could
+# return a mix of pre- and post-push file versions — typically observed as
+# the SHA256SUMS check failing right after a push because the CI-updated
+# SHA256SUMS hasn't aged out of cache yet.
+BASE_URL=""
 
 # ── Colours (tput — available on every macOS without bash) ───────────────────
 _bold=$(tput bold   2>/dev/null || printf '')
@@ -44,6 +51,26 @@ command -v shasum >/dev/null 2>&1 || die "shasum is required but not installed."
 # after a partial failure without re-downloading everything.
 mkdir -p "${WORK_DIR}"
 cd "${WORK_DIR}"
+
+# ── Resolve branch to immutable commit SHA ───────────────────────────────────
+# The GitHub commits API is served from api.github.com (much shorter cache
+# than raw.githubusercontent.com), so it surfaces the true HEAD quickly after
+# a push. Once resolved, every file download below uses a URL like
+#   raw.githubusercontent.com/.../<sha>/mac/dev/<file>
+# which is a unique cache key per commit — fresh on first fetch, immune to
+# the stale `main/...` cache that's been observed serving mismatched files.
+#
+# `posix-shell-safe JSON extraction`: the API response includes the head
+# commit SHA in `"sha":"<40-hex>"`. grep + cut is enough to pull it out
+# without requiring jq (which isn't on a fresh Mac).
+header "Resolving ${BRANCH} → commit SHA…"
+COMMIT_SHA="$(curl -fsSL -H 'Cache-Control: no-cache' \
+  "https://api.github.com/repos/${REPO}/branches/${BRANCH}" \
+  | grep -m1 -oE '"sha"[[:space:]]*:[[:space:]]*"[0-9a-f]{40}"' \
+  | cut -d'"' -f4)"
+[ -n "${COMMIT_SHA}" ] || die "Could not resolve ${BRANCH} → commit SHA"
+success "Pinned to ${COMMIT_SHA}"
+BASE_URL="https://raw.githubusercontent.com/${REPO}/${COMMIT_SHA}/mac/dev"
 
 # ── Download ──────────────────────────────────────────────────────────────────
 header "Downloading files…"
