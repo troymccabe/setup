@@ -36,6 +36,21 @@ success() { echo -e "${GREEN}  ✓  $*${RESET}"; }
 warn()    { echo -e "${YELLOW}  ⚠  $*${RESET}"; }
 header()  { echo -e "\n${BOLD}$*${RESET}"; }
 
+# ── Banner ────────────────────────────────────────────────────────────────────
+# printf (not echo) — the format-string \033 in $CYAN/$RESET needs interpreting,
+# which printf does by default and `echo` does not (without -e). The format
+# string is reused for each argument, so it must contain exactly one \n.
+echo
+printf "${CYAN}%s${RESET}\n" \
+  '  ███╗   ███╗ █████╗  ██████╗    ███████╗███████╗████████╗██╗   ██╗██████╗ ' \
+  '  ████╗ ████║██╔══██╗██╔════╝    ██╔════╝██╔════╝╚══██╔══╝██║   ██║██╔══██╗' \
+  '  ██╔████╔██║███████║██║         ███████╗█████╗     ██║   ██║   ██║██████╔╝' \
+  '  ██║╚██╔╝██║██╔══██║██║         ╚════██║██╔══╝     ██║   ██║   ██║██╔═══╝ ' \
+  '  ██║ ╚═╝ ██║██║  ██║╚██████╗    ███████║███████╗   ██║   ╚██████╔╝██║     ' \
+  '  ╚═╝     ╚═╝╚═╝  ╚═╝ ╚═════╝    ╚══════╝╚══════╝   ╚═╝    ╚═════╝╚═╝     '
+printf "${BOLD}%s${RESET}\n\n" \
+  '                                          fresh mac · macOS Tahoe · troymccabe'
+
 if $DRY_RUN; then
   warn "DRY-RUN mode — no changes will be made"
 fi
@@ -120,10 +135,20 @@ if ! command -v mas &>/dev/null; then
   info "Installing mas…"
   run brew install mas
 fi
-if ! $DRY_RUN && ! mas account &>/dev/null; then
-  warn "Not signed in to the App Store."
-  warn "Please open the App Store app, sign in, then press Enter to continue."
-  read -r -p "  Press Enter once signed in… " </dev/tty
+# `mas account` was removed in mas 2.x (the version Homebrew ships on Tahoe).
+# It now prints "Account command is no longer supported" and exits 1 — there
+# is no programmatic way to verify sign-in. Treat that specific exit as
+# "assume signed in" so re-runs aren't blocked by a prompt that can never be
+# resolved automatically. Older mas (1.x) is still handled via the fallback.
+if ! $DRY_RUN; then
+  MAS_OUT="$(mas account 2>&1 || true)"
+  if echo "$MAS_OUT" | grep -qiE "no longer supported|not supported"; then
+    info "mas account check unavailable on this mas version — assuming signed in"
+  elif ! mas account &>/dev/null; then
+    warn "Not signed in to the App Store."
+    warn "Please open the App Store app, sign in, then press Enter to continue."
+    read -r -p "  Press Enter once signed in… " </dev/tty
+  fi
 fi
 success "App Store session active"
 
@@ -495,7 +520,7 @@ success "Finder ✓"
 run mysides add "Developer"  "file://${HOME}/Developer/"
 run mysides add "Home"       "file://${HOME}/"
 run mysides add "Pictures"   "file://${HOME}/Pictures/"
-run mysides add "Screenshots" "file://${HOME}/Screenshots/"
+run mysides add "Screenshots" "file://${HOME}/Pictures/Screenshots/"
 
 success "Finder sidebar ✓"
 
@@ -504,7 +529,8 @@ success "Finder sidebar ✓"
 # ────────────────────────────────────────────────────────────────────────────
 
 # https://developer.apple.com/documentation/devicemanagement/mouse
-# Disable "natural" scroll direction for mice
+# Disable "natural" scroll direction (applies to mouse + trackpad — single
+# global setting; macOS has no separate per-device key here).
 run defaults write NSGlobalDomain com.apple.swipescrolldirection -bool false
 
 success "Mouse ✓"
@@ -535,7 +561,7 @@ run defaults write com.apple.TextEdit CheckSpellingWhileTyping -bool false
 # Disable global auto-correct
 run defaults write NSGlobalDomain NSAutomaticSpellingCorrectionEnabled -bool false
 
-# Open new TextEdit documents as plain text (0 = RTF, 1 = plain text)
+# Open new TextEdit documents as plain text (0 = plain text, 1 = rich text)
 # (No Apple MDM key; community method)
 run defaults write com.apple.TextEdit RichText -int 0
 
@@ -566,8 +592,11 @@ success "TextEdit ✓"
 # (No Apple MDM key; community method via Xcode plist)
 run defaults write com.apple.dt.Xcode IDEDerivedDataPathStyle -string "Relative"
 
-# Route Simulator / iPhone Mirroring captures to the Screenshots folder
+# Route Simulator screenshots to the Screenshots folder.
 # (No Apple MDM key; community method via iphonesimulator plist)
+# NOTE: Simulator screen recordings (Cmd-R) use a save panel — there is no
+# defaults key for them. Verified against the Simulator binary in Xcode 26
+# (only `ScreenShotSaveLocation` exists).
 run defaults write com.apple.iphonesimulator ScreenShotSaveLocation \
   -string "$HOME/Pictures/Screenshots"
 
@@ -625,7 +654,11 @@ if [[ -f "$AVATAR" ]]; then
       printf "0x0A 0x5C 0x3A 0x2C dsRecTypeStandard:Users 2 dsAttrTypeStandard:RecordName externalbinary:dsAttrTypeStandard:JPEGPhoto\n"
       printf "%s:%s\n" "$USER" "$AVATAR"
     } > "$AVATAR_DSIMPORT"
-    sudo dsimport "$AVATAR_DSIMPORT" /Local/Default M --recordtype dsRecTypeStandard:Users 2>/dev/null ||       warn "Profile picture import failed — you can set it manually in System Settings → Users & Groups"
+    # dsimport flags: <file> <node> <option>. Option 'M' = merge.
+    # The record type is declared in the file header — there is no
+    # --recordtype CLI flag.
+    sudo dsimport "$AVATAR_DSIMPORT" /Local/Default M 2>/dev/null \
+      || warn "Profile picture import failed — set it manually in System Settings → Users & Groups"
     rm -rf "$AVATAR_TMPDIR"
     success "Profile picture set from avatar.png"
   fi
