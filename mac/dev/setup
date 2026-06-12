@@ -9,6 +9,13 @@
 
 set -euo pipefail
 
+# Surface the exact failure point on any `set -e` exit. Without this, a
+# non-zero return inside an `eval` or backgrounded subshell can silently kill
+# the script — the user sees only the line that printed just before. Trap
+# prints to stderr in red so it's obvious. ERR fires before bash exits, so
+# $LINENO still points at the failing line.
+trap 'echo -e "\033[0;31m  ✗  Failed at line $LINENO: ${BASH_COMMAND}\033[0m" >&2' ERR
+
 # ── Dry-run flag ──────────────────────────────────────────────────────────────
 DRY_RUN=false
 [[ "${1:-}" == "--dry-run" ]] && DRY_RUN=true
@@ -126,6 +133,18 @@ fi
 if [[ -f /opt/homebrew/bin/brew ]]; then
   eval "$(/opt/homebrew/bin/brew shellenv)"
 fi
+
+# Untap obsolete custom taps. mas moved to homebrew-core and
+# git-credential-manager moved to homebrew-cask, so these third-party taps no
+# longer back any package in the Brewfile — they just emit a trust-prompt
+# warning on every brew invocation. Safe to untap on machines that never had
+# them (brew untap returns non-zero, hence `|| true`).
+for obsolete_tap in mas-cli/tap microsoft/git; do
+  if brew tap 2>/dev/null | grep -qx "$obsolete_tap"; then
+    info "Untapping obsolete tap: $obsolete_tap"
+    run brew untap "$obsolete_tap" || true
+  fi
+done
 
 # ==============================================================================
 # 3. APP STORE (mas) — sign-in required before brew bundle
@@ -290,7 +309,11 @@ header "8 / 11  Runtime versions via mise"
 # Activate mise in the current shell so installed runtimes are immediately
 # available to the commands that follow (e.g. dotnet, cargo, gem, npm).
 # Failures here are non-fatal — the shell may not be fully interactive.
-eval "$(mise activate bash)" 2>/dev/null || true
+#
+# `set +u` around the eval: mise's activate script touches variables that may
+# be unset (PROMPT_COMMAND, etc.). Under `set -u`, that kills the *current*
+# shell mid-eval and `|| true` can't save us. Relax nounset for the eval only.
+set +u; eval "$(mise activate bash)" 2>/dev/null || true; set -u
 
 # Pin to known-good major versions. Individual projects can override via
 # .mise.toml in their repo root. Update these lines to bump globals.
@@ -323,8 +346,9 @@ for runtime in dotnet go node php python ruby rust; do
   success "$runtime ${version} ready"
 done
 
-# Re-activate so the PATH shims for newly installed runtimes are live
-eval "$(mise activate bash)" 2>/dev/null || true
+# Re-activate so the PATH shims for newly installed runtimes are live.
+# See the matching `set +u` block above for why nounset is relaxed here.
+set +u; eval "$(mise activate bash)" 2>/dev/null || true; set -u
 hash -r 2>/dev/null || true
 
 # ── .NET ──────────────────────────────────────────────────────────────────────
