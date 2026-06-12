@@ -448,11 +448,32 @@ if ! $DRY_RUN; then
   else
     info "Downloading & installing latest Xcode (this will take a while)…"
     xcodes install --latest --experimental-unxip
-    echo 1 | xcodes select
     success "Xcode installed"
+  fi
+
+  # Select the newest installed Xcode app via `xcode-select -s` directly.
+  # `xcodes select` is interactive: it pipes the menu choice to stdin, then
+  # internally calls `sudo -S xcode-select -s …`, trying to read the macOS
+  # password from that same (now-closed) stdin — so it always fails non-
+  # interactively. Skip it. The sudo keepalive loop above maintains a fresh
+  # timestamp, so this `sudo` call won't prompt either.
+  XCODE_APP="$(ls -dt /Applications/Xcode-*.app 2>/dev/null | head -1 || true)"
+  if [[ -z "$XCODE_APP" ]]; then
+    warn "No /Applications/Xcode-*.app found — skipping select"
+  else
+    EXPECTED_DEV="${XCODE_APP}/Contents/Developer"
+    CURRENT_DEV="$(xcode-select -p 2>/dev/null || true)"
+    if [[ "$CURRENT_DEV" == "$EXPECTED_DEV" ]]; then
+      success "Xcode already selected: $XCODE_APP"
+    else
+      info "Selecting Xcode at $XCODE_APP"
+      sudo xcode-select -s "$XCODE_APP"
+      success "Xcode selected: $XCODE_APP"
+    fi
   fi
 else
   echo "  [dry-run] xcodes install --latest --experimental-unxip"
+  echo "  [dry-run] sudo xcode-select -s /Applications/Xcode-*.app"
 fi
 
 info "Accepting Xcode license…"
