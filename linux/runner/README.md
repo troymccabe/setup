@@ -164,6 +164,24 @@ them. Two ways they're supported:
 
 Set `SECURITY_NESTING=false` to opt out of nesting in container mode.
 
+**Getting Docker into the image.** Simplest is a one-time bake so every job
+starts with the daemon ready (avoids reinstalling per job):
+
+```sh
+# container mode — nesting must be on to install/run Docker inside
+incus launch images:ubuntu/24.04 build -c security.nesting=true
+incus exec build -- bash -c 'curl -fsSL https://get.docker.com | sh'
+incus exec build -- systemctl enable docker
+incus stop build
+incus publish build --alias ubuntu-docker
+incus delete build
+# then: DISTRO=ubuntu-docker IMAGE_REMOTE=local: linux/runner/setup
+```
+
+For `vm` mode, drop `-c security.nesting=true` and add `--vm`. Or skip baking
+and pass `PROVISION_CMD='curl -fsSL https://get.docker.com | sh'` to install on
+each fresh instance (slower per job).
+
 ## Adding distros, DEs & hosts
 
 - **Another variant on the same host** — re-run with a different `DISTRO`

@@ -24,13 +24,27 @@ ready-to-clone CI images, so you build the base once yourself:
    services are on by default), set a **known local admin password**, install
    any baseline build tooling you want pre-baked (VS Build Tools, Git, language
    SDKs — anything here is skipped per-job).
-3. Generalize with **Sysprep** (`sysprep /generalize /oobe /shutdown`) so each
+3. *(Optional — for Docker jobs)* install **Docker + the Containers feature**
+   so `docker` steps work with `NESTED_VIRT` (on by default). On **Server**:
+
+   ```powershell
+   Install-WindowsFeature -Name Containers
+   Install-Module -Name DockerMsftProvider -Force
+   Install-Package -Name docker -ProviderName DockerMsftProvider -Force
+   Set-Service docker -StartupType Automatic
+   ```
+
+   On **Windows 10/11**, install Docker Desktop (or dockerd) and enable the
+   **Containers** and **Hyper-V** optional features. Leave the daemon set to
+   start automatically so it's up before a job runs. Verify with `docker info`
+   before sysprepping.
+4. Generalize with **Sysprep** (`sysprep /generalize /oobe /shutdown`) so each
    clone gets a unique identity.
-4. Note the resulting `.vhdx` path and the admin password — those are
+5. Note the resulting `.vhdx` path and the admin password — those are
    `BASE_VHDX` and `VM_PASS`.
 
 [Packer](https://www.packer.io/) with the `hyperv-iso` builder automates all of
-this if you'd rather not do it by hand.
+this (including the Docker step) if you'd rather not do it by hand.
 
 ## Quick start
 
