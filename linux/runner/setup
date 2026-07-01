@@ -1,0 +1,556 @@
+#!/usr/bin/env bash
+# Ephemeral Incus-backed GitHub Actions runner — one-shot setup (Linux).
+#
+# The Linux sibling of mac/runner/setup. Same shape — JIT runner
+# registration + a run-one-job-then-destroy orchestrator + a boot service —
+# but the isolation primitive is Incus instead of Tart, and the boot
+# service is systemd instead of launchd.
+#
+# Run straight from the repo, once per distro/DE variant you want to serve:
+#
+#     GH_ORG=YourOrg GH_PAT=ghp_xxxxx DISTRO=ubuntu/24.04 linux/runner/setup
+#     GH_ORG=YourOrg GH_PAT=ghp_xxxxx DISTRO=fedora/40    linux/runner/setup
+#     GH_ORG=YourOrg GH_PAT=ghp_xxxxx DISTRO=archlinux    linux/runner/setup
+#
+# Or `curl | sh` from the raw file:
+#
+#     GH_ORG=YourOrg GH_PAT=ghp_xxxxx DISTRO=debian/12 \
+#         bash <(curl -fsSL https://raw.githubusercontent.com/troymccabe/setup/main/linux/runner/setup)
+#
+# REQUIRED env vars:
+#   GH_ORG          GitHub organization (e.g. "MyOrg")
+#   GH_PAT          PAT with "Self-hosted runners (Admin)" permission on the org
+#                   Fine-grained tokens are recommended.
+#
+# OPTIONAL env vars (defaults shown):
+#   DISTRO          Incus image to build against            [ubuntu/24.04]
+#                   Any name on the IMAGE_REMOTE server —
+#                   ubuntu/24.04, debian/12, fedora/40,
+#                   archlinux, opensuse/tumbleweed, …
+#                   (see: incus image list images:)
+#   INSTANCE_TYPE   "container" or "vm"                     [container]
+#                   container = shares host kernel, ~instant, ideal for the
+#                   distro-userland matrix. vm = own kernel + /dev/kvm,
+#                   needed for kernel-module / GPU / real-compositor work.
+#   IMAGE_REMOTE    Incus image server to pull DISTRO from  [images:]
+#   RUNNER_GROUP    Org-level runner group name             [linux-runners]
+#   SHARED_LABEL    Fleet label all runners carry           [linux-runner]
+#   HOST_LABEL      Per-host label (this machine)           [<hostname -s, lowercased>]
+#   EXTRA_LABELS    Comma-separated labels to append        [""]
+#                   e.g. "gnome,wayland" for a desktop runner
+#   SCOPE_REPO      "owner/repo" to gate the group to;      [""]
+#                   empty = org-wide (any repo in org may use these runners)
+#   PROVISION_CMD   Shell run inside each fresh instance    [""]
+#                   before the runner starts. This is the desktop-environment
+#                   hook, e.g.:
+#                     INSTANCE_TYPE=vm EXTRA_LABELS=gnome \
+#                     PROVISION_CMD='apt-get update && apt-get install -y ubuntu-desktop'
+#                   For speed, bake heavy provisioning into a custom Incus
+#                   image instead and point DISTRO at it (see README).
+#   VM_MEMORY_MB    Per-instance memory limit               [4096]
+#   VM_CPU_COUNT    Per-instance CPUs                        [4]
+#   VM_DISK_GB      Root disk size (vm mode only)            [40]
+#   HOST_RESERVE_MB Memory to keep free for the host        [2048]
+#                   In vm mode each orchestrator waits until the host has
+#                   (VM_MEMORY_MB + HOST_RESERVE_MB) available before booting,
+#                   so multiple orchestrators on one box don't overcommit.
+#                   Containers are memory-cheap and skip this gate.
+#   SERVICE_NAME    systemd unit name                       [gha-runner-<org>-<distro>]
+#   CONFIG_DIR      Where to stash config + scripts         [~/.gha-runner/<distro>]
+#
+# Serving various distros / desktop environments:
+#   Each run of this script provisions ONE distro/DE variant as its own
+#   orchestrator (own service, own config dir, own DISTRO label). Run it
+#   once per variant on the same host — they coexist and compete for RAM
+#   via HOST_RESERVE_MB. Workflows then target a variant by label:
+#     runs-on: [self-hosted, linux-runner]        # any Linux host in the fleet
+#     runs-on: [self-hosted, ubuntu-24.04]        # this distro
+#     runs-on: [self-hosted, gnome]               # a desktop-enabled variant
+#
+# Re-running is idempotent — the runner group + repo scoping are no-op on
+# the second pass, the orchestrator + unit are overwritten with the same
+# content, the systemd service is restarted, the base image is refreshed.
+#
+# Surviving reboots:
+#   Unlike macOS, this needs no GUI login. The orchestrator installs as a
+#   systemd SYSTEM service (WantedBy=multi-user.target, Restart=always), so
+#   it starts at boot on a headless box with nobody logged in. The service
+#   runs as the invoking user with the incus-admin group; Incus itself is a
+#   system daemon started by its own unit.
+#
+# Requires: Linux with an Incus-capable kernel, sudo, and one of
+#   apt / dnf / pacman / zypper. Incus + jq are installed if missing.
+#   vm mode additionally requires hardware virtualization (/dev/kvm).
+
+set -euo pipefail
+
+__main__() {
+  # -----------------------------------------------------------------------
+  # Required inputs
+  # -----------------------------------------------------------------------
+  : "${GH_ORG:?GH_ORG must be set (e.g. GH_ORG=MyOrg)}"
+  : "${GH_PAT:?GH_PAT must be set (PAT with Self-hosted runners: Admin)}"
+
+  # -----------------------------------------------------------------------
+  # Optional inputs with defaults
+  # -----------------------------------------------------------------------
+  slugify() {
+    printf '%s' "$1" | tr '[:upper:]' '[:lower:]' \
+      | sed -e 's#[^a-z0-9]#-#g' -e 's#-\{2,\}#-#g' -e 's#^-##' -e 's#-$##'
+  }
+
+  DISTRO="${DISTRO:-ubuntu/24.04}"
+  INSTANCE_TYPE="${INSTANCE_TYPE:-container}"
+  IMAGE_REMOTE="${IMAGE_REMOTE:-images:}"
+  RUNNER_GROUP="${RUNNER_GROUP:-linux-runners}"
+  SHARED_LABEL="${SHARED_LABEL:-linux-runner}"
+  HOST_LABEL="${HOST_LABEL:-$(hostname -s | tr '[:upper:]' '[:lower:]')}"
+  EXTRA_LABELS="${EXTRA_LABELS:-}"
+  SCOPE_REPO="${SCOPE_REPO:-}"
+  PROVISION_CMD="${PROVISION_CMD:-}"
+  VM_MEMORY_MB="${VM_MEMORY_MB:-4096}"
+  VM_CPU_COUNT="${VM_CPU_COUNT:-4}"
+  VM_DISK_GB="${VM_DISK_GB:-40}"
+  HOST_RESERVE_MB="${HOST_RESERVE_MB:-2048}"
+
+  if [[ "$INSTANCE_TYPE" != "container" && "$INSTANCE_TYPE" != "vm" ]]; then
+    echo "ERROR: INSTANCE_TYPE must be 'container' or 'vm' (got '$INSTANCE_TYPE')" >&2
+    exit 1
+  fi
+
+  # DISTRO_LABEL keeps dots for readable GitHub labels (ubuntu-24.04); SLUG
+  # strips everything but [a-z0-9-] for Incus instance / alias / unit names,
+  # which disallow dots and slashes.
+  local ORG_SLUG SLUG DISTRO_LABEL ARCH_LABEL
+  ORG_SLUG="$(slugify "$GH_ORG")"
+  SLUG="$(slugify "$DISTRO")"
+  DISTRO_LABEL="$(printf '%s' "$DISTRO" | tr '[:upper:]/' '[:lower:]-')"
+
+  case "$(uname -m)" in
+    x86_64)          ARCH_LABEL="X64" ;;
+    aarch64|arm64)   ARCH_LABEL="ARM64" ;;
+    *) echo "ERROR: unsupported host arch $(uname -m)" >&2; exit 1 ;;
+  esac
+
+  SERVICE_NAME="${SERVICE_NAME:-gha-runner-$ORG_SLUG-$SLUG}"
+  CONFIG_DIR="${CONFIG_DIR:-$HOME/.gha-runner/$SLUG}"
+
+  local BASE_ALIAS="gha-base-$SLUG"
+  local INSTANCE_PREFIX="gha-$SLUG-"
+  local CONFIG_FILE="$CONFIG_DIR/config.env"
+  local ORCH_SCRIPT="$CONFIG_DIR/orchestrator.sh"
+  local UNIT_PATH="/etc/systemd/system/$SERVICE_NAME.service"
+
+  step() { printf '\n==> %s\n' "$*"; }
+  gh_api() {
+    curl -fsS \
+      -H "Authorization: Bearer $GH_PAT" \
+      -H "Accept: application/vnd.github+json" \
+      -H "X-GitHub-Api-Version: 2022-11-28" \
+      "$@"
+  }
+
+  # -----------------------------------------------------------------------
+  # Sanity checks
+  # -----------------------------------------------------------------------
+  step "Sanity checks"
+  if [[ "$(uname -s)" != "Linux" ]]; then
+    echo "ERROR: this script is for Linux — use mac/runner/setup on macOS" >&2
+    exit 1
+  fi
+  if ! command -v sudo >/dev/null; then
+    echo "ERROR: sudo required (package install + service management)" >&2; exit 1
+  fi
+  if [[ "$INSTANCE_TYPE" == "vm" && ! -e /dev/kvm ]]; then
+    echo "ERROR: INSTANCE_TYPE=vm needs hardware virtualization (/dev/kvm missing)." >&2
+    echo "       Enable VT-x/AMD-V in firmware, or use INSTANCE_TYPE=container." >&2
+    exit 1
+  fi
+  echo "  $(uname -s) $(uname -r) on $(uname -m), org=$GH_ORG, distro=$DISTRO ($INSTANCE_TYPE) ✓"
+
+  # -----------------------------------------------------------------------
+  # Tooling: incus + jq + curl, via whichever package manager is present
+  # -----------------------------------------------------------------------
+  step "Installing incus + jq + curl"
+  install_pkgs() {
+    if command -v apt-get >/dev/null; then
+      sudo apt-get update -qq
+      sudo DEBIAN_FRONTEND=noninteractive apt-get install -y "$@"
+    elif command -v dnf >/dev/null; then
+      sudo dnf install -y "$@"
+    elif command -v pacman >/dev/null; then
+      sudo pacman -Sy --noconfirm --needed "$@"
+    elif command -v zypper >/dev/null; then
+      sudo zypper --non-interactive install -y "$@"
+    else
+      echo "ERROR: no supported package manager (apt/dnf/pacman/zypper)" >&2
+      return 1
+    fi
+  }
+  local want=()
+  command -v curl >/dev/null || want+=(curl)
+  command -v jq   >/dev/null || want+=(jq)
+  command -v incus >/dev/null || want+=(incus)
+  if (( ${#want[@]} )); then
+    install_pkgs "${want[@]}" || true
+  fi
+  if ! command -v incus >/dev/null; then
+    echo "ERROR: incus not installed — your distro may not package it yet." >&2
+    echo "       See https://linuxcontainers.org/incus/docs/main/installing/" >&2
+    exit 1
+  fi
+
+  # -----------------------------------------------------------------------
+  # Incus daemon, group membership, and initialization
+  # -----------------------------------------------------------------------
+  step "Preparing the Incus daemon"
+  # The daemon is socket-activated; enable both so it survives reboots.
+  sudo systemctl enable --now incus.socket >/dev/null 2>&1 || true
+  sudo systemctl enable --now incus         >/dev/null 2>&1 || true
+
+  # Resolve the admin group (Zabbly/Debian ship incus-admin; some ship incus).
+  local INCUS_GROUP=""
+  if getent group incus-admin >/dev/null; then INCUS_GROUP="incus-admin"
+  elif getent group incus     >/dev/null; then INCUS_GROUP="incus"
+  fi
+  if [[ -n "$INCUS_GROUP" ]] && ! id -nG "$USER" | tr ' ' '\n' | grep -qx "$INCUS_GROUP"; then
+    echo "  adding $USER to $INCUS_GROUP (effective for the service immediately)"
+    sudo usermod -aG "$INCUS_GROUP" "$USER"
+  fi
+
+  # This shell may not yet carry the new group, so fall back to sudo for the
+  # setup-time incus calls. The daemon is system-wide, so images/instances
+  # created via sudo are the same ones the service (running as $USER with the
+  # incus-admin group) will see.
+  local INCUS
+  if incus info >/dev/null 2>&1; then INCUS="incus"; else INCUS="sudo incus"; fi
+
+  # Initialize storage + network on first use (no-op if already done).
+  if ! $INCUS storage list --format csv 2>/dev/null | grep -q .; then
+    echo "  running 'incus admin init --auto'"
+    $INCUS admin init --auto
+  else
+    echo "  already initialized"
+  fi
+
+  # -----------------------------------------------------------------------
+  # Base image
+  # -----------------------------------------------------------------------
+  step "Caching base image locally: ${IMAGE_REMOTE}${DISTRO} -> $BASE_ALIAS"
+  local TYPE_FLAG=""
+  [[ "$INSTANCE_TYPE" == "vm" ]] && TYPE_FLAG="--vm"
+  # Refresh the local alias each run so re-running picks up upstream updates.
+  # Deleting the cached image is safe even with instances running — launched
+  # instances are independent copy-on-write clones.
+  $INCUS image delete "$BASE_ALIAS" >/dev/null 2>&1 || true
+  # shellcheck disable=SC2086
+  $INCUS image copy "${IMAGE_REMOTE}${DISTRO}" local: --alias "$BASE_ALIAS" $TYPE_FLAG
+
+  # -----------------------------------------------------------------------
+  # Runner group + repo scoping (identical to the macOS flow)
+  # -----------------------------------------------------------------------
+  step "Ensuring runner group '$RUNNER_GROUP' exists"
+  local groups_json group_id
+  groups_json="$(gh_api "https://api.github.com/orgs/$GH_ORG/actions/runner-groups")"
+  group_id="$(echo "$groups_json" | jq -r --arg n "$RUNNER_GROUP" \
+    '.runner_groups[] | select(.name==$n) | .id')"
+
+  if [[ -z "$group_id" || "$group_id" == "null" ]]; then
+    local visibility="all" body
+    [[ -n "$SCOPE_REPO" ]] && visibility="selected"
+    body="$(jq -nc --arg name "$RUNNER_GROUP" --arg vis "$visibility" \
+      '{name:$name, visibility:$vis, selected_repository_ids:[], allows_public_repositories:false}')"
+    group_id="$(gh_api -X POST \
+      "https://api.github.com/orgs/$GH_ORG/actions/runner-groups" \
+      -d "$body" | jq -r .id)"
+    echo "  created group id=$group_id (visibility=$visibility)"
+  else
+    echo "  found existing group id=$group_id"
+  fi
+
+  if [[ -n "$SCOPE_REPO" ]]; then
+    step "Scoping group to $SCOPE_REPO"
+    local repo_id
+    repo_id="$(gh_api "https://api.github.com/repos/$SCOPE_REPO" | jq -r .id)"
+    gh_api -X PUT \
+      "https://api.github.com/orgs/$GH_ORG/actions/runner-groups/$group_id/repositories/$repo_id" \
+      -o /dev/null
+    echo "  repo id=$repo_id added to group"
+  fi
+
+  # -----------------------------------------------------------------------
+  # Persist config (PROVISION_CMD is base64-encoded so newlines/quotes in it
+  # survive the round-trip through config.env)
+  # -----------------------------------------------------------------------
+  step "Writing config to $CONFIG_FILE"
+  mkdir -p "$CONFIG_DIR"
+  umask 077
+  local PROVISION_CMD_B64
+  PROVISION_CMD_B64="$(printf '%s' "$PROVISION_CMD" | base64 | tr -d '\n')"
+  cat > "$CONFIG_FILE" <<EOF
+# Auto-generated by linux/runner/setup. Re-running setup overwrites this.
+GH_ORG="$GH_ORG"
+GH_PAT="$GH_PAT"
+RUNNER_GROUP="$RUNNER_GROUP"
+SHARED_LABEL="$SHARED_LABEL"
+HOST_LABEL="$HOST_LABEL"
+EXTRA_LABELS="$EXTRA_LABELS"
+SCOPE_REPO="$SCOPE_REPO"
+DISTRO="$DISTRO"
+DISTRO_LABEL="$DISTRO_LABEL"
+INSTANCE_TYPE="$INSTANCE_TYPE"
+ARCH_LABEL="$ARCH_LABEL"
+BASE_ALIAS="$BASE_ALIAS"
+INSTANCE_PREFIX="$INSTANCE_PREFIX"
+VM_MEMORY_MB="$VM_MEMORY_MB"
+VM_CPU_COUNT="$VM_CPU_COUNT"
+VM_DISK_GB="$VM_DISK_GB"
+HOST_RESERVE_MB="$HOST_RESERVE_MB"
+PROVISION_CMD_B64="$PROVISION_CMD_B64"
+EOF
+  chmod 600 "$CONFIG_FILE"
+
+  # -----------------------------------------------------------------------
+  # Orchestrator
+  # -----------------------------------------------------------------------
+  step "Writing $ORCH_SCRIPT"
+  cat > "$ORCH_SCRIPT" <<'ORCHESTRATOR_EOF'
+#!/usr/bin/env bash
+# Ephemeral Incus GHA runner orchestrator. Generated by linux/runner/setup.
+# Loops: clone base image → boot ephemeral instance → provision →
+# install runner → run one JIT ephemeral job → destroy instance.
+
+set -uo pipefail
+
+CONFIG_DIR="${CONFIG_DIR:-$HOME/.gha-runner}"
+# shellcheck disable=SC1090
+source "$CONFIG_DIR/config.env"
+PROVISION_CMD="$(printf '%s' "$PROVISION_CMD_B64" | base64 -d)"
+
+log() { printf '[%s] %s\n' "$(date +%H:%M:%S)" "$*"; }
+
+gh_api() {
+  curl -fsS \
+    -H "Authorization: Bearer $GH_PAT" \
+    -H "Accept: application/vnd.github+json" \
+    -H "X-GitHub-Api-Version: 2022-11-28" \
+    "$@"
+}
+
+fetch_group_id() {
+  gh_api "https://api.github.com/orgs/$GH_ORG/actions/runner-groups" \
+    | jq -r --arg n "$RUNNER_GROUP" '.runner_groups[] | select(.name==$n) | .id'
+}
+
+cleanup_instance() {
+  local name="$1"
+  # Ephemeral instances auto-delete on stop; --force covers a hung guest,
+  # and the explicit delete covers the non-ephemeral fallback.
+  incus stop "$name" --force >/dev/null 2>&1 || true
+  incus delete "$name" --force >/dev/null 2>&1 || true
+}
+
+# Capacity gate (vm mode only): block until the host has RAM for this VM plus
+# the host reserve. Containers are memory-cheap and skip the gate.
+host_avail_mb() { awk '/MemAvailable/{print int($2/1024)}' /proc/meminfo; }
+wait_for_ram_capacity() {
+  [[ "$INSTANCE_TYPE" == "vm" ]] || return 0
+  local need avail
+  need=$(( VM_MEMORY_MB + HOST_RESERVE_MB ))
+  while true; do
+    avail="$(host_avail_mb)"
+    if [[ "$avail" -ge "$need" ]]; then return 0; fi
+    log "waiting for RAM (need $need MB, $avail MB available)"
+    sleep 15
+  done
+}
+
+# Reap any instances left from a setup re-run / restart that killed us mid-job.
+reap_orphans() {
+  incus list --format csv -c n 2>/dev/null \
+    | grep "^${INSTANCE_PREFIX}" \
+    | while read -r orphan; do
+        [ -n "$orphan" ] && cleanup_instance "$orphan"
+      done
+}
+reap_orphans
+
+TYPE_FLAG=""
+[[ "$INSTANCE_TYPE" == "vm" ]] && TYPE_FLAG="--vm"
+
+while true; do
+  sfx="$(tr -dc 'a-z0-9' </dev/urandom | head -c 8)"
+  inst="${INSTANCE_PREFIX}${sfx}"
+  runner_name="$HOST_LABEL-$DISTRO_LABEL-$(date +%s)"
+  log "spawning instance=$inst runner=$runner_name"
+
+  GROUP_ID="$(fetch_group_id)"
+  if [[ -z "$GROUP_ID" || "$GROUP_ID" == "null" ]]; then
+    log "ERROR: runner group '$RUNNER_GROUP' not found"; sleep 60; continue
+  fi
+
+  # JIT runners don't inherit the platform labels ./config.sh would add, so
+  # the labels list must be COMPLETE: self-hosted / OS / arch + our labels.
+  extra_json="$(jq -cn --arg e "$EXTRA_LABELS" \
+    '($e | split(",") | map(gsub("^\\s+|\\s+$";"")) | map(select(length>0)))')"
+  labels_json="$(jq -cn \
+    --arg a "$ARCH_LABEL" --arg s "$SHARED_LABEL" --arg h "$HOST_LABEL" \
+    --arg d "$DISTRO_LABEL" --argjson x "$extra_json" \
+    '["self-hosted", "Linux", $a, $s, $h, $d] + $x')"
+  jit_body="$(jq -nc \
+    --arg name "$runner_name" \
+    --argjson group_id "$GROUP_ID" \
+    --argjson labels "$labels_json" \
+    '{name:$name, runner_group_id:$group_id, labels:$labels, work_folder:"_work"}')"
+  jit_response="$(gh_api -X POST \
+    "https://api.github.com/orgs/$GH_ORG/actions/runners/generate-jitconfig" \
+    -d "$jit_body")" || { log "ERROR: generate-jitconfig failed"; sleep 30; continue; }
+  jitconfig="$(echo "$jit_response" | jq -r .encoded_jit_config)"
+  if [[ -z "$jitconfig" || "$jitconfig" == "null" ]]; then
+    log "ERROR: empty JIT config from API"; sleep 30; continue
+  fi
+
+  wait_for_ram_capacity
+
+  launch_args=(local:"$BASE_ALIAS" "$inst" --ephemeral
+    -c limits.memory="${VM_MEMORY_MB}MiB" -c limits.cpu="$VM_CPU_COUNT")
+  [[ -n "$TYPE_FLAG" ]] && launch_args+=("$TYPE_FLAG")
+  # Root-disk sizing only applies to VMs; container quotas need a
+  # quota-capable storage pool, so leave containers at pool default.
+  [[ "$INSTANCE_TYPE" == "vm" ]] && launch_args+=(-d root,size="${VM_DISK_GB}GiB")
+
+  if ! incus launch "${launch_args[@]}"; then
+    log "ERROR: incus launch failed"; cleanup_instance "$inst"; sleep 30; continue
+  fi
+  trap 'cleanup_instance "$inst"; exit' INT TERM
+
+  # Wait for the instance to accept commands (VMs need the incus agent up).
+  ready=0
+  for _ in $(seq 1 60); do
+    incus exec "$inst" -- true >/dev/null 2>&1 && { ready=1; break; }
+    sleep 2
+  done
+  if [[ "$ready" -ne 1 ]]; then
+    log "ERROR: instance never became ready"; cleanup_instance "$inst"; sleep 30; continue
+  fi
+
+  # Optional user provisioning (desktop environment, extra build deps, …).
+  if [[ -n "$PROVISION_CMD" ]]; then
+    log "provisioning $inst"
+    if ! incus exec "$inst" -- bash -lc "$PROVISION_CMD"; then
+      log "ERROR: provisioning failed"; cleanup_instance "$inst"; sleep 30; continue
+    fi
+  fi
+
+  # Install + run the runner inside the instance via `incus exec` (no SSH).
+  # A fresh ephemeral instance has no runner cached, so install every job;
+  # bake it into a custom image if the per-job download cost matters.
+  incus exec "$inst" --env RUNNER_ALLOW_RUNASROOT=1 -- bash -s -- "$jitconfig" <<'INVMEOF'
+set -euo pipefail
+JITCONFIG="$1"
+cd "$HOME"
+
+# Runtime prerequisites: the runner needs curl+tar to bootstrap and ICU at
+# run time. Cover the four major package managers.
+if command -v apt-get >/dev/null; then
+  export DEBIAN_FRONTEND=noninteractive
+  apt-get update -qq && apt-get install -y -qq curl ca-certificates tar libicu >/dev/null
+elif command -v dnf >/dev/null; then
+  dnf install -y -q curl tar libicu >/dev/null
+elif command -v pacman >/dev/null; then
+  pacman -Sy --noconfirm --needed curl tar icu >/dev/null
+elif command -v zypper >/dev/null; then
+  zypper --non-interactive install -y curl tar libicu >/dev/null
+fi
+
+case "$(uname -m)" in
+  x86_64)        rarch=x64 ;;
+  aarch64|arm64) rarch=arm64 ;;
+  *) echo "ERROR: unsupported guest arch $(uname -m)" >&2; exit 1 ;;
+esac
+
+ver="$(curl -fsS https://api.github.com/repos/actions/runner/releases/latest \
+  | sed -n 's/.*"tag_name": "v\([^"]*\)".*/\1/p' | head -1)"
+[ -n "$ver" ] || { echo "ERROR: could not resolve runner version" >&2; exit 1; }
+
+mkdir -p ~/actions-runner && cd ~/actions-runner
+curl -fsSL -o runner.tar.gz \
+  "https://github.com/actions/runner/releases/download/v$ver/actions-runner-linux-$rarch-$ver.tar.gz"
+tar xzf runner.tar.gz && rm runner.tar.gz
+
+exec ./run.sh --jitconfig "$JITCONFIG"
+INVMEOF
+  exit_code=$?
+  log "instance $inst runner exited (code=$exit_code)"
+
+  cleanup_instance "$inst"
+  if [[ "$exit_code" -ne 0 ]]; then
+    log "backoff 30s on non-zero exit"; sleep 30
+  fi
+done
+ORCHESTRATOR_EOF
+  chmod +x "$ORCH_SCRIPT"
+
+  # -----------------------------------------------------------------------
+  # systemd service (system-level → starts at boot, no login needed)
+  # -----------------------------------------------------------------------
+  step "Installing systemd service ($SERVICE_NAME)"
+  local SUPP=""
+  [[ -n "$INCUS_GROUP" ]] && SUPP="SupplementaryGroups=$INCUS_GROUP"
+  sudo tee "$UNIT_PATH" >/dev/null <<UNIT_EOF
+[Unit]
+Description=Ephemeral Incus GHA runner ($GH_ORG / $DISTRO)
+After=network-online.target incus.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=$USER
+Group=$(id -gn "$USER")
+$SUPP
+Environment=CONFIG_DIR=$CONFIG_DIR
+WorkingDirectory=$CONFIG_DIR
+ExecStart=/bin/bash $ORCH_SCRIPT
+Restart=always
+RestartSec=10
+StandardOutput=append:$CONFIG_DIR/orchestrator.log
+StandardError=append:$CONFIG_DIR/orchestrator.err
+
+[Install]
+WantedBy=multi-user.target
+UNIT_EOF
+
+  sudo systemctl daemon-reload
+  sudo systemctl enable "$SERVICE_NAME" >/dev/null
+  sudo systemctl restart "$SERVICE_NAME"
+
+  # -----------------------------------------------------------------------
+  # Done
+  # -----------------------------------------------------------------------
+  step "Setup complete"
+  cat <<NEXT
+
+Service:
+  • Unit:       $SERVICE_NAME  (system-level, starts at boot)
+  • Logs:       tail -F $CONFIG_DIR/orchestrator.log
+  • Status:     systemctl status $SERVICE_NAME
+  • Stop:       sudo systemctl stop $SERVICE_NAME
+  • Restart:    sudo systemctl restart $SERVICE_NAME
+  • Remove:     sudo systemctl disable --now $SERVICE_NAME && sudo rm $UNIT_PATH
+
+GitHub:
+  • Each job spawns a fresh $INSTANCE_TYPE ($DISTRO) with labels:
+      self-hosted, Linux, $ARCH_LABEL + $SHARED_LABEL + $HOST_LABEL + $DISTRO_LABEL${EXTRA_LABELS:+ + $EXTRA_LABELS}
+
+Workflow usage:
+  runs-on: [self-hosted, $SHARED_LABEL]    # any Linux host in the fleet
+  runs-on: [self-hosted, $DISTRO_LABEL]    # this distro/DE variant
+  runs-on: [self-hosted, $HOST_LABEL]      # this specific host
+
+Adding another distro/DE on this host:
+  Re-run with a different DISTRO (and INSTANCE_TYPE / PROVISION_CMD /
+  EXTRA_LABELS). Each variant gets its own service and coexists here.
+NEXT
+}
+
+__main__ "$@"
