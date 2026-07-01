@@ -58,6 +58,19 @@
 #   With auto-login on: reboot → login → LaunchAgent loads → orchestrator
 #   starts. Without it, someone must log in once after each reboot.
 #
+# Scaling beyond one host:
+#   This is a single-host design — each Mac runs its own launchd loop and
+#   schedules VMs against its LOCAL free RAM (see HOST_RESERVE_MB). That's
+#   simplest for 1–2 machines. At ~3+ hosts, consider Orchard
+#   (https://github.com/cirruslabs/orchard), Cirrus's cluster scheduler
+#   for Tart: a central controller bin-packs VMs across a pool of workers,
+#   replacing the per-host capacity guessing (wait_for_ram_capacity),
+#   manual HOST_RESERVE_MB tuning, and orphan reaping with fleet-wide
+#   scheduling and one `orchard list vms` view. Caveats: it still drives
+#   `tart` (so the GUI-login requirement above is unchanged), it adds a
+#   controller to run, and the GHA JIT-registration glue below stays yours
+#   — Orchard places VMs, it doesn't register runners.
+#
 # Requires: macOS 14+, Apple Silicon, Homebrew.
 
 set -euo pipefail
