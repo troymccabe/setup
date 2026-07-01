@@ -1,0 +1,460 @@
+#!/usr/bin/env bash
+# Ephemeral Tart-backed GitHub Actions runner — one-shot setup.
+#
+# Run straight from the repo:
+#
+#     GH_ORG=YourOrg GH_PAT=ghp_xxxxx mac/runner/setup
+#
+# Or `curl | sh` from the raw file:
+#
+#     GH_ORG=YourOrg GH_PAT=ghp_xxxxx \
+#         bash <(curl -fsSL https://raw.githubusercontent.com/troymccabe/setup/main/mac/runner/setup)
+#
+# Or, if you prefer to inspect first:
+#
+#     curl -fsSL https://raw.githubusercontent.com/troymccabe/setup/main/mac/runner/setup -o setup
+#     GH_ORG=... GH_PAT=... bash setup
+#
+# REQUIRED env vars:
+#   GH_ORG          GitHub organization (e.g. "MyOrg")
+#   GH_PAT          PAT with "Self-hosted runners (Admin)" permission on the org
+#                   Fine-grained tokens are recommended.
+#
+# OPTIONAL env vars (defaults shown):
+#   RUNNER_GROUP    Org-level runner group name           [macos-runners]
+#   SHARED_LABEL    Fleet label all runners carry         [macos-runner]
+#   HOST_LABEL      Per-host label (this machine)         [<hostname -s, lowercased>]
+#   SCOPE_REPO      "owner/repo" to gate the group to;    [""]
+#                   empty = org-wide (any repo in org may use these runners)
+#   BASE_IMAGE      Tart base image                       [ghcr.io/cirruslabs/macos-tahoe-xcode:latest]
+#   VM_MEMORY_MB    Per-VM memory                         [10240]
+#   VM_CPU_COUNT    Per-VM CPUs                           [4]
+#   VM_DISK_GB      Per-VM disk (GB)                      [120]
+#   HOST_RESERVE_MB Memory to keep free for the host OS   [6144]
+#                   When multiple orchestrators run on
+#                   one host, each waits until host has
+#                   (VM_MEMORY_MB + HOST_RESERVE_MB) free
+#                   before booting. Auto-scales to host
+#                   capacity: 16 GB host serialises,
+#                   64 GB host fits 5+ concurrent VMs.
+#   LAUNCHD_LABEL   launchd job label                     [dev.<lowercased-GH_ORG>.gha-runner]
+#   CONFIG_DIR      Where to stash config + scripts       [~/.gha-runner]
+#
+# Re-running is idempotent — the runner group + repo scoping are no-op on
+# the second pass, the orchestrator + plist are overwritten with the same
+# content, the launchd service is cycled.
+#
+# Surviving reboots:
+#   This installs a LaunchAgent, which loads only inside a logged-in GUI
+#   (Aqua) session — NOT at the login window. A LaunchDaemon won't help:
+#   Tart uses Virtualization.framework, which needs a GUI session, so it
+#   can't run pre-login. For an unattended runner, configure the host to
+#   log in automatically on boot:
+#     • System Settings ▸ Users & Groups ▸ "Automatically log in as" ▸ <user>
+#       (requires FileVault OFF — it blocks auto-login).
+#     • sudo pmset -a sleep 0 displaysleep 0   # don't let the host sleep
+#     • System Settings ▸ Energy ▸ "Start up automatically after a power
+#       failure" (or: sudo pmset -a autorestart 1).
+#   With auto-login on: reboot → login → LaunchAgent loads → orchestrator
+#   starts. Without it, someone must log in once after each reboot.
+#
+# Requires: macOS 14+, Apple Silicon, Homebrew.
+
+set -euo pipefail
+
+__main__() {
+  # -----------------------------------------------------------------------
+  # Required inputs
+  # -----------------------------------------------------------------------
+  : "${GH_ORG:?GH_ORG must be set (e.g. GH_ORG=MyOrg)}"
+  : "${GH_PAT:?GH_PAT must be set (PAT with Self-hosted runners: Admin)}"
+
+  # -----------------------------------------------------------------------
+  # Optional inputs with defaults
+  # -----------------------------------------------------------------------
+  local ORG_LOWER
+  ORG_LOWER="$(printf '%s' "$GH_ORG" | tr '[:upper:]' '[:lower:]')"
+
+  RUNNER_GROUP="${RUNNER_GROUP:-macos-runners}"
+  SHARED_LABEL="${SHARED_LABEL:-macos-runner}"
+  HOST_LABEL="${HOST_LABEL:-$(hostname -s | tr '[:upper:]' '[:lower:]')}"
+  SCOPE_REPO="${SCOPE_REPO:-}"
+  BASE_IMAGE="${BASE_IMAGE:-ghcr.io/cirruslabs/macos-tahoe-xcode:latest}"
+  VM_MEMORY_MB="${VM_MEMORY_MB:-10240}"
+  VM_CPU_COUNT="${VM_CPU_COUNT:-4}"
+  VM_DISK_GB="${VM_DISK_GB:-120}"
+  HOST_RESERVE_MB="${HOST_RESERVE_MB:-6144}"
+  LAUNCHD_LABEL="${LAUNCHD_LABEL:-dev.$ORG_LOWER.gha-runner}"
+  CONFIG_DIR="${CONFIG_DIR:-$HOME/.gha-runner}"
+
+  local CONFIG_FILE="$CONFIG_DIR/config.env"
+  local ORCH_SCRIPT="$CONFIG_DIR/orchestrator.sh"
+  local PLIST_PATH="$HOME/Library/LaunchAgents/$LAUNCHD_LABEL.plist"
+
+  step() { printf '\n==> %s\n' "$*"; }
+  gh_api() {
+    curl -fsS \
+      -H "Authorization: Bearer $GH_PAT" \
+      -H "Accept: application/vnd.github+json" \
+      -H "X-GitHub-Api-Version: 2022-11-28" \
+      "$@"
+  }
+
+  # -----------------------------------------------------------------------
+  # Sanity checks
+  # -----------------------------------------------------------------------
+  step "Sanity checks"
+  if [[ "$(uname -m)" != "arm64" ]]; then
+    echo "ERROR: Apple Silicon required" >&2; exit 1
+  fi
+  if ! command -v brew >/dev/null; then
+    echo "ERROR: Homebrew required (https://brew.sh)" >&2; exit 1
+  fi
+  echo "  macOS $(sw_vers -productVersion) on $(uname -m), org=$GH_ORG ✓"
+
+  # -----------------------------------------------------------------------
+  # Tooling
+  # -----------------------------------------------------------------------
+  step "Installing tart + softnet + jq + sshpass"
+  # softnet is a sibling formula in the cirruslabs/cli tap and is
+  # pulled in as a transitive dependency of tart. Homebrew 4.4+ gates
+  # per-formula trust in third-party taps — naming both formulae
+  # explicitly on the install command line makes brew treat each as
+  # user-requested (and therefore trusted), so the install proceeds.
+  if ! brew install \
+      cirruslabs/cli/softnet \
+      cirruslabs/cli/tart \
+      jq sshpass 2>&1 | grep -E "^(==>|Warning|Error)"; then
+    echo "  (no warnings)"
+  fi
+  if ! command -v tart >/dev/null; then
+    echo "ERROR: tart didn't install — see brew output above" >&2
+    exit 1
+  fi
+
+  # -----------------------------------------------------------------------
+  # Base image
+  # -----------------------------------------------------------------------
+  step "Pulling base image: $BASE_IMAGE"
+  tart pull "$BASE_IMAGE"
+
+  # -----------------------------------------------------------------------
+  # Runner group + repo scoping
+  # -----------------------------------------------------------------------
+  step "Ensuring runner group '$RUNNER_GROUP' exists"
+  local groups_json group_id
+  groups_json="$(gh_api "https://api.github.com/orgs/$GH_ORG/actions/runner-groups")"
+  group_id="$(echo "$groups_json" | jq -r --arg n "$RUNNER_GROUP" \
+    '.runner_groups[] | select(.name==$n) | .id')"
+
+  if [[ -z "$group_id" || "$group_id" == "null" ]]; then
+    local visibility="all"
+    local body
+    if [[ -n "$SCOPE_REPO" ]]; then
+      visibility="selected"
+    fi
+    body="$(jq -nc --arg name "$RUNNER_GROUP" --arg vis "$visibility" \
+      '{name:$name, visibility:$vis, selected_repository_ids:[], allows_public_repositories:false}')"
+    group_id="$(gh_api -X POST \
+      "https://api.github.com/orgs/$GH_ORG/actions/runner-groups" \
+      -d "$body" | jq -r .id)"
+    echo "  created group id=$group_id (visibility=$visibility)"
+  else
+    echo "  found existing group id=$group_id"
+  fi
+
+  if [[ -n "$SCOPE_REPO" ]]; then
+    step "Scoping group to $SCOPE_REPO"
+    local repo_id
+    repo_id="$(gh_api "https://api.github.com/repos/$SCOPE_REPO" | jq -r .id)"
+    gh_api -X PUT \
+      "https://api.github.com/orgs/$GH_ORG/actions/runner-groups/$group_id/repositories/$repo_id" \
+      -o /dev/null
+    echo "  repo id=$repo_id added to group"
+  fi
+
+  # -----------------------------------------------------------------------
+  # Persist config (so the orchestrator + future re-runs find it)
+  # -----------------------------------------------------------------------
+  step "Writing config to $CONFIG_FILE"
+  mkdir -p "$CONFIG_DIR"
+  umask 077
+  cat > "$CONFIG_FILE" <<EOF
+# Auto-generated by mac-runner-setup.sh. Re-running setup overwrites this.
+GH_ORG="$GH_ORG"
+GH_PAT="$GH_PAT"
+RUNNER_GROUP="$RUNNER_GROUP"
+SHARED_LABEL="$SHARED_LABEL"
+HOST_LABEL="$HOST_LABEL"
+SCOPE_REPO="$SCOPE_REPO"
+BASE_IMAGE="$BASE_IMAGE"
+VM_MEMORY_MB="$VM_MEMORY_MB"
+VM_CPU_COUNT="$VM_CPU_COUNT"
+VM_DISK_GB="$VM_DISK_GB"
+HOST_RESERVE_MB="$HOST_RESERVE_MB"
+EOF
+  chmod 600 "$CONFIG_FILE"
+
+  # -----------------------------------------------------------------------
+  # Orchestrator
+  # -----------------------------------------------------------------------
+  step "Writing $ORCH_SCRIPT"
+  cat > "$ORCH_SCRIPT" <<'ORCHESTRATOR_EOF'
+#!/usr/bin/env bash
+# Ephemeral Tart GHA runner orchestrator. Generated by mac-runner-setup.sh.
+# Loops: clone base image → boot VM → install runner inside VM →
+# register JIT ephemeral runner → run one job → destroy VM.
+
+set -uo pipefail
+
+# Resolve config dir from env (set by launchd) or default.
+CONFIG_DIR="${CONFIG_DIR:-$HOME/.gha-runner}"
+# shellcheck disable=SC1090
+source "$CONFIG_DIR/config.env"
+
+log() { printf '[%s] %s\n' "$(date +%H:%M:%S)" "$*"; }
+
+gh_api() {
+  curl -fsS \
+    -H "Authorization: Bearer $GH_PAT" \
+    -H "Accept: application/vnd.github+json" \
+    -H "X-GitHub-Api-Version: 2022-11-28" \
+    "$@"
+}
+
+ssh_vm() {
+  sshpass -p admin ssh \
+    -o StrictHostKeyChecking=no \
+    -o UserKnownHostsFile=/dev/null \
+    -o ServerAliveInterval=30 \
+    -o LogLevel=ERROR \
+    "admin@$1" "${@:2}"
+}
+
+fetch_group_id() {
+  gh_api "https://api.github.com/orgs/$GH_ORG/actions/runner-groups" \
+    | jq -r --arg n "$RUNNER_GROUP" '.runner_groups[] | select(.name==$n) | .id'
+}
+
+cleanup_vm() {
+  local name="$1"
+  tart stop "$name" >/dev/null 2>&1 || true
+  tart delete "$name" >/dev/null 2>&1 || true
+}
+
+# Capacity-based scheduling: wait until host has enough free RAM for
+# (this VM + HOST_RESERVE_MB). With multiple orchestrators on one
+# machine, each waits independently — on a 16 GB host with two
+# orchestrators wanting 10 GB VMs, they serialise naturally; on a
+# 64 GB host they run concurrently.
+host_total_mb() {
+  echo "$(( $(sysctl -n hw.memsize) / 1024 / 1024 ))"
+}
+running_vm_mem_mb() {
+  tart list --format json 2>/dev/null \
+    | jq -r '[.[]? | select(.State=="running") | .Memory // 0] | add // 0' \
+    || echo 0
+}
+wait_for_ram_capacity() {
+  local total free needed
+  total="$(host_total_mb)"
+  needed=$(( VM_MEMORY_MB + HOST_RESERVE_MB ))
+  while true; do
+    free=$(( total - $(running_vm_mem_mb) ))
+    if [[ "$free" -ge "$needed" ]]; then
+      return 0
+    fi
+    log "waiting for RAM (need $needed MB, $free MB free, total $total MB)"
+    sleep 15
+  done
+}
+
+# Reap any orphans left from a setup re-run that killed us mid-job.
+reap_orphans() {
+  tart list --format json 2>/dev/null \
+    | jq -r '.[]? | select(.Name | startswith("ephem-")) | .Name' \
+    | while read -r orphan; do
+        [ -n "$orphan" ] && cleanup_vm "$orphan"
+      done
+}
+reap_orphans
+
+while true; do
+  vm_name="ephem-$(uuidgen | tr 'A-Z' 'a-z' | cut -c1-8)"
+  runner_name="$HOST_LABEL-$(date +%s)"
+  log "spawning vm=$vm_name runner=$runner_name"
+
+  GROUP_ID="$(fetch_group_id)"
+  if [[ -z "$GROUP_ID" || "$GROUP_ID" == "null" ]]; then
+    log "ERROR: runner group '$RUNNER_GROUP' not found"
+    sleep 60; continue
+  fi
+
+  # JIT-registered runners don't auto-apply the platform labels that
+  # ./config.sh normally would (self-hosted / macOS / arm64). The
+  # `labels` field passed to generate-jitconfig is the COMPLETE set,
+  # so include them explicitly — otherwise workflows that ask for
+  # `[self-hosted, macos-26]` won't match this runner.
+  labels_json="$(jq -nc --arg s "$SHARED_LABEL" --arg h "$HOST_LABEL" \
+    '["self-hosted", "macOS", "arm64", $s, $h]')"
+  jit_body="$(jq -nc \
+    --arg name "$runner_name" \
+    --argjson group_id "$GROUP_ID" \
+    --argjson labels "$labels_json" \
+    '{name:$name, runner_group_id:$group_id, labels:$labels, work_folder:"_work"}')"
+  jit_response="$(gh_api -X POST \
+    "https://api.github.com/orgs/$GH_ORG/actions/runners/generate-jitconfig" \
+    -d "$jit_body")" || {
+    log "ERROR: generate-jitconfig failed"
+    sleep 30; continue
+  }
+  jitconfig="$(echo "$jit_response" | jq -r .encoded_jit_config)"
+  if [[ -z "$jitconfig" || "$jitconfig" == "null" ]]; then
+    log "ERROR: empty JIT config from API"
+    sleep 30; continue
+  fi
+
+  if ! tart clone "$BASE_IMAGE" "$vm_name"; then
+    log "ERROR: tart clone failed"; sleep 30; continue
+  fi
+  tart set "$vm_name" \
+    --memory "$VM_MEMORY_MB" \
+    --cpu "$VM_CPU_COUNT" \
+    --disk-size "$VM_DISK_GB" >/dev/null
+
+  # Block until the host has RAM for this VM (auto-scales
+  # concurrency across orchestrators based on host capacity).
+  wait_for_ram_capacity
+
+  tart run "$vm_name" --no-graphics >>"$CONFIG_DIR/vm-$vm_name.log" 2>&1 &
+  vm_pid=$!
+  trap 'cleanup_vm "$vm_name"; exit' INT TERM
+
+  vm_ip=""
+  for _ in $(seq 1 90); do
+    vm_ip="$(tart ip "$vm_name" 2>/dev/null || true)"
+    [[ -n "$vm_ip" ]] && break
+    sleep 2
+  done
+  if [[ -z "$vm_ip" ]]; then
+    log "ERROR: vm never got an IP"; cleanup_vm "$vm_name"; sleep 30; continue
+  fi
+  log "vm $vm_name @ $vm_ip — waiting for sshd"
+  for _ in $(seq 1 60); do
+    ssh_vm "$vm_ip" "true" >/dev/null 2>&1 && break
+    sleep 2
+  done
+
+  ssh_vm "$vm_ip" "bash -s -- '$jitconfig'" <<'INVMEOF'
+set -euo pipefail
+JITCONFIG="$1"
+cd "$HOME"
+
+runner_version="$(curl -fsS https://api.github.com/repos/actions/runner/releases/latest \
+  | sed -n 's/.*"tag_name": "v\([^"]*\)".*/\1/p' | head -1)"
+if [[ -z "$runner_version" ]]; then
+  echo "ERROR: could not resolve runner version" >&2
+  exit 1
+fi
+
+if [[ ! -x ~/actions-runner/run.sh ]]; then
+  mkdir -p ~/actions-runner && cd ~/actions-runner
+  url="https://github.com/actions/runner/releases/download/v$runner_version/actions-runner-osx-arm64-$runner_version.tar.gz"
+  curl -fsSL -o runner.tar.gz "$url"
+  tar xzf runner.tar.gz
+  rm runner.tar.gz
+fi
+
+cd ~/actions-runner
+exec ./run.sh --jitconfig "$JITCONFIG"
+INVMEOF
+  exit_code=$?
+  log "vm $vm_name runner exited (code=$exit_code)"
+
+  cleanup_vm "$vm_name"
+  wait "$vm_pid" 2>/dev/null || true
+  if [[ "$exit_code" -ne 0 ]]; then
+    log "backoff 30s on non-zero exit"
+    sleep 30
+  fi
+done
+ORCHESTRATOR_EOF
+  chmod +x "$ORCH_SCRIPT"
+
+  # -----------------------------------------------------------------------
+  # launchd
+  # -----------------------------------------------------------------------
+  step "Installing launchd service ($LAUNCHD_LABEL)"
+  mkdir -p "$(dirname "$PLIST_PATH")"
+  cat > "$PLIST_PATH" <<PLIST_EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>$LAUNCHD_LABEL</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>$ORCH_SCRIPT</string>
+  </array>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>$CONFIG_DIR/orchestrator.log</string>
+  <key>StandardErrorPath</key>
+  <string>$CONFIG_DIR/orchestrator.err</string>
+  <key>WorkingDirectory</key>
+  <string>$CONFIG_DIR</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    <key>CONFIG_DIR</key>
+    <string>$CONFIG_DIR</string>
+  </dict>
+</dict>
+</plist>
+PLIST_EOF
+
+  launchctl unload "$PLIST_PATH" 2>/dev/null || true
+  launchctl load "$PLIST_PATH"
+
+  # -----------------------------------------------------------------------
+  # Done
+  # -----------------------------------------------------------------------
+  step "Setup complete"
+  cat <<NEXT
+
+Service:
+  • Label:      $LAUNCHD_LABEL
+  • Logs:       tail -F $CONFIG_DIR/orchestrator.log
+  • Stop:       launchctl unload $PLIST_PATH
+  • Restart:    launchctl unload $PLIST_PATH && launchctl load $PLIST_PATH
+
+Surviving reboots:
+  This is a LaunchAgent — it starts on GUI login, not at the login window
+  (Tart needs a GUI session, so a LaunchDaemon won't work). For an
+  unattended host, enable auto-login so it starts itself after a reboot:
+    • System Settings ▸ Users & Groups ▸ Automatically log in as ▸ <user>
+      (requires FileVault OFF)
+    • sudo pmset -a sleep 0 displaysleep 0 autorestart 1
+  Without auto-login, log in once after each reboot to start the runner.
+
+GitHub:
+  • Each job spawns a fresh runner with labels:
+      self-hosted, macOS, arm64 (auto) + $SHARED_LABEL + $HOST_LABEL
+
+Workflow usage:
+  runs-on: [self-hosted, $SHARED_LABEL]    # any host in the fleet
+  runs-on: [self-hosted, $HOST_LABEL]      # this specific host
+
+Adding another host:
+  Run this script on the new machine with HOST_LABEL=<name>. Same
+  GH_ORG + RUNNER_GROUP + SHARED_LABEL → joins the same fleet.
+NEXT
+}
+
+__main__ "$@"
