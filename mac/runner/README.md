@@ -5,6 +5,7 @@ job gets a fresh, throwaway macOS VM: clone base image → boot → JIT-register
 runner → run one job → destroy. Nothing from one job leaks into the next.
 
 See [`../../linux/runner`](../../linux/runner) for the Linux (Incus) sibling.
+See [`../../windows/runner`](../../windows/runner) for the Windows (Hyper-V) sibling.
 
 ## Quick start
 

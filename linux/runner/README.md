@@ -4,9 +4,8 @@ Ephemeral, Incus-backed GitHub Actions runners. Each CI job gets a fresh,
 throwaway instance: clone base image → boot → provision → JIT-register a
 runner → run one job → destroy. Nothing from one job leaks into the next.
 
-The Linux sibling of [`../../mac/runner`](../../mac/runner) — same shape, but
-the isolation primitive is **Incus** (not Tart) and the boot service is
-**systemd** (not launchd).
+See [`../../mac/runner`](../../mac/runner) for the Mac (Tart) sibling.
+See [`../../windows/runner`](../../windows/runner) for the Windows (Hyper-V) sibling.
 
 ## Why Incus
 
@@ -97,6 +96,7 @@ Set via environment variables at run time (defaults shown):
 | `VM_MEMORY_MB` / `VM_CPU_COUNT` | `4096` / `4` | Per-instance limits |
 | `VM_DISK_GB` | `40` | Root disk size (`vm` mode only) |
 | `HOST_RESERVE_MB` | `2048` | RAM kept free for the host; gates `vm` concurrency |
+| `SECURITY_NESTING` | `true` | Allow Docker / nested containers in `container` mode (VMs don't need it) |
 | `SERVICE_NAME` | `gha-runner-<org>-<distro>` | systemd unit name |
 | `CONFIG_DIR` | `~/.gha-runner/<distro>` | Config + scripts location |
 
@@ -148,6 +148,21 @@ sudo systemctl disable --now gha-runner-<org>-<distro> \
 ```
 
 ---
+
+## Docker / container jobs
+
+Actions job-level `container:` and service containers are Linux-only, so this
+runner is their natural home — and you can't control whether a workflow uses
+them. Two ways they're supported:
+
+- **`container` mode** — the orchestrator sets `security.nesting=true` by
+  default (`SECURITY_NESTING`), which lets Docker / nested containers run inside
+  the system container. Docker itself must be in the image (bake it, or install
+  via `PROVISION_CMD`).
+- **`vm` mode** — a real kernel, so Docker "just works" with full isolation and
+  no privileged-nesting trade-off. Heavier per job.
+
+Set `SECURITY_NESTING=false` to opt out of nesting in container mode.
 
 ## Adding distros, DEs & hosts
 
