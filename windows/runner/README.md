@@ -18,7 +18,7 @@ containers work if the base image ships Docker — see [Docker jobs](#docker-job
 Unlike Tart (macOS) and Incus (Linux), Windows has no public catalog of
 ready-to-clone CI images, so you build the base once yourself:
 
-1. Create a **Generation 2 (UEFI)** VM, install Windows 10/11 or Server
+1. Create a **Generation 2 (UEFI)** VM, install Windows 11 or Server
    2019/2022/2025 from an ISO.
 2. Inside it: enable PowerShell Direct's prerequisites (Windows integration
    services are on by default), set a **known local admin password**, install
@@ -34,7 +34,7 @@ ready-to-clone CI images, so you build the base once yourself:
    Set-Service docker -StartupType Automatic
    ```
 
-   On **Windows 10/11**, install Docker Desktop (or dockerd) and enable the
+   On **Windows 11**, install Docker Desktop (or dockerd) and enable the
    **Containers** and **Hyper-V** optional features. Leave the daemon set to
    start automatically so it's up before a job runs. Verify with `docker info`
    before sysprepping.

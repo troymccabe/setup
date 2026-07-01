@@ -68,7 +68,7 @@ Surviving reboots:
   starts at boot with nobody logged in. Plain build/test jobs run headless;
   only interactive-desktop jobs would need guest autologon.
 
-Requires: Windows 10/11 or Server 2016+ with Hyper-V, run as Administrator.
+Requires: Windows 11 or Server 2016+ with Hyper-V, run as Administrator.
 #>
 [CmdletBinding()]
 param(
