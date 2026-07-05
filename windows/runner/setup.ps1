@@ -265,10 +265,46 @@ function Wait-Ram($needMb) {
   while ((Get-FreeMb) -lt $needMb) { Log "waiting for RAM (need $needMb MB, $(Get-FreeMb) MB free)"; Start-Sleep 15 }
 }
 
+# --- GitHub-side runner cleanup ------------------------------------------
+# Ephemeral runners only self-deregister after finishing a job. One killed
+# while idle-waiting (reboot / task stop / crash) lingers in GitHub as an
+# "offline" runner forever. Track every id we register in a ledger; delete
+# leftovers at startup and as each runner is released.
+$Ledger = Join-Path $ConfigDir 'pending-runners'
+$script:CurrentRunnerId = $null
+
+function Unregister-Runner($id) {
+  if (-not $id) { return }
+  try { Invoke-GhApi -Method DELETE -Url "https://api.github.com/orgs/$($c.GhOrg)/actions/runners/$id" | Out-Null } catch {}
+}
+function Add-LedgerId($id)    { if ($id) { Add-Content -LiteralPath $Ledger -Value "$id" } }
+function Remove-LedgerId($id) {
+  if (-not $id -or -not (Test-Path -LiteralPath $Ledger)) { return }
+  @(Get-Content -LiteralPath $Ledger) | Where-Object { $_ -and $_ -ne "$id" } | Set-Content -LiteralPath $Ledger
+}
+# Release the in-flight runner: drop it from the ledger and deregister it
+# (idempotent — a 404 just means the ephemeral runner already self-removed).
+function Clear-CurrentRunner {
+  if ($script:CurrentRunnerId) {
+    Remove-LedgerId $script:CurrentRunnerId
+    Unregister-Runner $script:CurrentRunnerId
+    $script:CurrentRunnerId = $null
+  }
+}
+
 # Reap orphans from a restart that killed us mid-job.
 Get-VM | Where-Object { $_.Name -like "$($c.InstancePrefix)*" } | ForEach-Object { Remove-Instance $_.Name }
 
+# Anything still in the ledger was registered but never finished (reboot/crash).
+if (Test-Path -LiteralPath $Ledger) {
+  foreach ($rid in @(Get-Content -LiteralPath $Ledger)) {
+    if ($rid) { Log "reaping leftover runner id=$rid"; Unregister-Runner $rid }
+  }
+  Clear-Content -LiteralPath $Ledger
+}
+
 while ($true) {
+  Clear-CurrentRunner
   $sfx  = -join ((48..57) + (97..122) | Get-Random -Count 8 | ForEach-Object { [char]$_ })
   $inst = "$($c.InstancePrefix)$sfx"
   $runnerName = "$($c.HostLabel)-$($c.ImageLabel)-$([DateTimeOffset]::UtcNow.ToUnixTimeSeconds())"
@@ -280,9 +316,13 @@ while ($true) {
   # JIT runners don't inherit platform labels, so the set must be COMPLETE.
   $labels = @('self-hosted', 'Windows', $c.ArchLabel, $c.SharedLabel, $c.HostLabel, $c.ImageLabel) + @($c.ExtraLabels)
   $body = @{ name = $runnerName; runner_group_id = $gid; labels = $labels; work_folder = '_work' } | ConvertTo-Json
-  try { $jit = (Invoke-GhApi -Method POST -Url "https://api.github.com/orgs/$($c.GhOrg)/actions/runners/generate-jitconfig" -Body $body).encoded_jit_config }
+  try { $jitResp = Invoke-GhApi -Method POST -Url "https://api.github.com/orgs/$($c.GhOrg)/actions/runners/generate-jitconfig" -Body $body; $jit = $jitResp.encoded_jit_config }
   catch { Log "ERROR: generate-jitconfig failed: $_"; Start-Sleep 30; continue }
   if (-not $jit) { Log 'ERROR: empty JIT config'; Start-Sleep 30; continue }
+
+  # Record the runner id so a reboot mid-job doesn't strand the registration.
+  $script:CurrentRunnerId = $jitResp.runner.id
+  Add-LedgerId $script:CurrentRunnerId
 
   # Resolve the runner version on the HOST (authenticated -> 5000/hr) so the
   # guest (sharing a NAT IP) never hits the unauthenticated rate limit.
