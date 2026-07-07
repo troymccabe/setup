@@ -332,6 +332,8 @@ CONFIG_DIR="${CONFIG_DIR:-$HOME/.gha-runner}"
 # shellcheck disable=SC1090
 source "$CONFIG_DIR/config.env"
 PROVISION_CMD="$(printf '%s' "$PROVISION_CMD_B64" | base64 -d)"
+LEDGER="$CONFIG_DIR/pending-runners"
+CURRENT_RUNNER_ID=""
 
 log() { printf '[%s] %s\n' "$(date +%H:%M:%S)" "$*"; }
 
@@ -354,6 +356,41 @@ cleanup_instance() {
   # and the explicit delete covers the non-ephemeral fallback.
   incus stop "$name" --force >/dev/null 2>&1 || true
   incus delete "$name" --force >/dev/null 2>&1 || true
+}
+
+# --- GitHub-side runner cleanup ------------------------------------------
+# Ephemeral runners only self-deregister after finishing a job. One killed
+# while idle-waiting (reboot / systemctl stop / crash) lingers in GitHub as
+# an "offline" runner forever. Track every id we register in a ledger; delete
+# leftovers at startup and as each runner is released.
+deregister_runner() {
+  [[ -n "${1:-}" ]] || return 0
+  gh_api -X DELETE \
+    "https://api.github.com/orgs/$GH_ORG/actions/runners/$1" -o /dev/null 2>/dev/null || true
+}
+ledger_add() { [[ -n "${1:-}" ]] && printf '%s\n' "$1" >> "$LEDGER"; return 0; }
+ledger_remove() {
+  [[ -f "$LEDGER" && -n "${1:-}" ]] || return 0
+  grep -vxF "$1" "$LEDGER" > "$LEDGER.tmp" 2>/dev/null || :
+  mv "$LEDGER.tmp" "$LEDGER" 2>/dev/null || :
+}
+# Release the in-flight runner: drop it from the ledger and deregister it
+# (idempotent — a 404 just means the ephemeral runner already self-removed).
+release_current_runner() {
+  [[ -n "$CURRENT_RUNNER_ID" ]] || return 0
+  ledger_remove "$CURRENT_RUNNER_ID"
+  deregister_runner "$CURRENT_RUNNER_ID"
+  CURRENT_RUNNER_ID=""
+}
+# Anything still in the ledger at startup was registered but never finished
+# (reboot/crash) — reap it. Runs before the loop, so it can't touch a runner
+# this process is about to create.
+reap_pending_runners() {
+  [[ -f "$LEDGER" ]] || return 0
+  while read -r rid; do
+    [[ -n "$rid" ]] && { log "reaping leftover runner id=$rid"; deregister_runner "$rid"; }
+  done < "$LEDGER"
+  : > "$LEDGER"
 }
 
 # Capacity gate (vm mode only): block until the host has RAM for this VM plus
@@ -380,11 +417,13 @@ reap_orphans() {
       done
 }
 reap_orphans
+reap_pending_runners
 
 TYPE_FLAG=""
 [[ "$INSTANCE_TYPE" == "vm" ]] && TYPE_FLAG="--vm"
 
 while true; do
+  release_current_runner
   sfx="$(tr -dc 'a-z0-9' </dev/urandom | head -c 8)"
   inst="${INSTANCE_PREFIX}${sfx}"
   runner_name="$HOST_LABEL-$DISTRO_LABEL-$(date +%s)"
@@ -416,6 +455,13 @@ while true; do
     log "ERROR: empty JIT config from API"; sleep 30; continue
   fi
 
+  # generate-jitconfig returns the runner's id; record it so a reboot mid-job
+  # doesn't strand the registration (reaped by reap_pending_runners at boot).
+  runner_id="$(echo "$jit_response" | jq -r '.runner.id')"
+  [[ "$runner_id" == "null" ]] && runner_id=""
+  CURRENT_RUNNER_ID="$runner_id"
+  ledger_add "$runner_id"
+
   wait_for_ram_capacity
 
   launch_args=(local:"$BASE_ALIAS" "$inst" --ephemeral
@@ -433,7 +479,7 @@ while true; do
   if ! incus launch "${launch_args[@]}"; then
     log "ERROR: incus launch failed"; cleanup_instance "$inst"; sleep 30; continue
   fi
-  trap 'cleanup_instance "$inst"; exit' INT TERM
+  trap 'cleanup_instance "$inst"; release_current_runner; exit' INT TERM
 
   # Wait for the instance to accept commands (VMs need the incus agent up).
   ready=0
