@@ -85,29 +85,6 @@ it, someone must log in once after each reboot.
 
 ---
 
-## Running XCUITest directly on a host (`keepawake`)
-
-CI runs XCUITest **inside Tart VMs**, each with its own auto-login, unlocked
-session — so the runner host's lock state never affects it. But if you also run
-XCUITest **directly on a host** (local iteration over SSH), its "enable
-automation mode" step times out against a locked screen (looks like a hang, not
-a test failure).
-
-`mac/keepawake` keeps a host's GUI session unlocked + awake for that case:
-screensaver + password-on-wake off, a `caffeinate` LaunchAgent (survives
-reboots), and `pmset` sleep off. It's deliberately **separate** from `setup` and
-opt-in per box — it weakens host lock security, so you don't want it fleet-wide.
-
-```sh
-mac/keepawake        # enable
-mac/keepawake off    # disable + remove the LaunchAgent
-```
-
-An already-locked session must be unlocked **once** (Screen Sharing) for it to
-take effect — `caffeinate` keeps a screen awake but can't unlock one.
-
----
-
 ## Managing the service
 
 ```sh
