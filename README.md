@@ -8,6 +8,12 @@ Personal machine bootstrap + self-hosted GitHub Actions runner fleet.
 |------|------|
 | [`mac/dev`](mac/dev) | Fresh-Mac bootstrap for macOS Tahoe — Homebrew, Brewfile, shell config, mise runtimes, Xcode, macOS defaults. |
 
+## macOS utilities
+
+| Path | What |
+|------|------|
+| [`mac/keepawake`](mac/keepawake) | Keep a Mac's GUI session unlocked + awake (screensaver/lock off, a `caffeinate` LaunchAgent, no sleep) so XCUITest — or any UI automation — can run **directly on the host**. Opt-in per box; the Tart-VM CI path doesn't need it. `keepawake off` reverses it. |
+
 ## CI runner fleet
 
 Ephemeral, self-hosted GitHub Actions runners. Each shares the same skeleton —

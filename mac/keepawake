@@ -1,0 +1,123 @@
+#!/usr/bin/env bash
+# keepawake — keep this Mac's GUI session UNLOCKED + AWAKE.
+#
+# Why: XCUITest's "enable automation mode" step times out against a locked
+# screen (the failure looks like a hang, not a test error). The Tart-VM CI
+# path is unaffected — each job boots its own fresh, auto-login, unlocked VM
+# session — so this is ONLY for running XCUITest (or any UI automation)
+# DIRECTLY on the host, e.g. local iteration over SSH. Kept out of the runner
+# `setup` on purpose: it weakens host lock security, so it's opt-in per box.
+#
+# What it does (idempotent):
+#   • disables the screensaver + password-on-wake (no-sudo, per-user) — the
+#     LOCK, not display sleep, is what freezes automation mode;
+#   • installs a `caffeinate -dis` LaunchAgent (RunAtLoad + KeepAlive) so the
+#     display never sleeps, surviving reboots (a one-shot caffeinate would not);
+#   • disables display/system sleep via `pmset` when passwordless sudo is
+#     available, else prints the one-liner (never blocks on a prompt).
+#
+# Run:
+#     mac/keepawake              # enable
+#     mac/keepawake off          # disable + remove the LaunchAgent
+#
+#     bash <(curl -fsSL https://raw.githubusercontent.com/troymccabe/setup/main/mac/keepawake)
+#
+# Caveats:
+#   • Security trade-off: the host never locks. Fine for a dedicated LAN CI/
+#     test box; don't run it on a shared or portable Mac.
+#   • An already-LOCKED session must be unlocked ONCE (Screen Sharing) for this
+#     to take effect — caffeinate keeps a screen awake but can't unlock one.
+#   • macOS 14+ can MDM-manage the screensaver "require password" pref; if
+#     automation still times out, set it in System Settings ▸ Lock Screen.
+#
+# Requires: macOS 14+.
+
+set -euo pipefail
+
+KEEPAWAKE_LABEL="${KEEPAWAKE_LABEL:-local.keepawake}"
+PLIST_PATH="$HOME/Library/LaunchAgents/$KEEPAWAKE_LABEL.plist"
+
+step() { printf '\n==> %s\n' "$*"; }
+
+enable() {
+  step "Enabling keepawake ($KEEPAWAKE_LABEL)"
+
+  # 1) No screensaver, no password-on-wake (no-sudo, per-user). The lock — not
+  #    display sleep — is what freezes automation mode.
+  defaults -currentHost write com.apple.screensaver idleTime -int 0
+  defaults -currentHost write com.apple.screensaver askForPassword -int 0
+  defaults -currentHost write com.apple.screensaver askForPasswordDelay -int 2147483647
+  killall cfprefsd 2>/dev/null || true
+  echo "  screensaver off; password-on-wake off."
+
+  # 2) caffeinate LaunchAgent — keeps the display awake and survives reboots
+  #    (a one-shot `caffeinate` would die; the agent relaunches on login).
+  mkdir -p "$(dirname "$PLIST_PATH")"
+  cat > "$PLIST_PATH" <<PLIST_EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>$KEEPAWAKE_LABEL</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/bin/caffeinate</string>
+    <string>-dis</string>
+  </array>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+</dict>
+</plist>
+PLIST_EOF
+  launchctl unload "$PLIST_PATH" 2>/dev/null || true
+  launchctl load "$PLIST_PATH"
+  echo "  caffeinate LaunchAgent loaded (display stays awake, survives reboot)."
+
+  # 3) Display/system sleep need sudo — apply if passwordless sudo is available,
+  #    else surface the one-liner (stays curl|sh-friendly).
+  if sudo -n pmset -a displaysleep 0 sleep 0 disksleep 0 2>/dev/null; then
+    echo "  pmset: display + system sleep disabled."
+  else
+    echo "  pmset needs sudo — run once: sudo pmset -a displaysleep 0 sleep 0"
+  fi
+
+  cat <<'NOTES'
+
+  NOTES:
+   • An already-LOCKED session must be unlocked ONCE (Screen Sharing) — caffeinate
+     keeps a screen awake but can't unlock one.
+   • macOS 14+ can MDM-manage the "require password" pref; if UI automation still
+     times out, set it in System Settings ▸ Lock Screen.
+   • Disable later with:  keepawake off
+NOTES
+}
+
+disable() {
+  step "Disabling keepawake ($KEEPAWAKE_LABEL)"
+  launchctl unload "$PLIST_PATH" 2>/dev/null || true
+  rm -f "$PLIST_PATH"
+  # Restore password-on-wake (lock again); drop the never-screensaver override.
+  defaults -currentHost write com.apple.screensaver askForPassword -int 1
+  defaults -currentHost delete com.apple.screensaver idleTime 2>/dev/null || true
+  defaults -currentHost delete com.apple.screensaver askForPasswordDelay 2>/dev/null || true
+  killall cfprefsd 2>/dev/null || true
+  echo "  removed the LaunchAgent + restored password-on-wake."
+  echo "  (display/system sleep left as-is — re-enable in System Settings ▸ Energy, or:"
+  echo "     sudo pmset -a displaysleep 10 sleep 1)"
+}
+
+main() {
+  if [[ "$(uname)" != "Darwin" ]]; then
+    echo "ERROR: macOS only" >&2; exit 1
+  fi
+  case "${1:-on}" in
+    on|enable|"")        enable ;;
+    off|disable|remove)  disable ;;
+    *) echo "usage: keepawake [on|off]" >&2; exit 2 ;;
+  esac
+}
+
+main "$@"
