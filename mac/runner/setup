@@ -24,12 +24,40 @@
 #   RUNNER_GROUP    Org-level runner group name           [macos-runners]
 #   SHARED_LABEL    Fleet label all runners carry         [macos-runner]
 #   HOST_LABEL      Per-host label (this machine)         [<hostname -s, lowercased>]
+#   EXTRA_LABELS    Comma-separated extra labels appended [""]
+#                   to every runner registration (e.g.
+#                   "mobile-runner,xcode-26.6" when the
+#                   image carries a mobile toolchain).
 #   SCOPE_REPO      "owner/repo" to gate the group to;    [""]
 #                   empty = org-wide (any repo in org may use these runners)
-#   BASE_IMAGE      Tart base image                       [ghcr.io/cirruslabs/macos-tahoe-xcode:latest]
+#   SOURCE_IMAGE    Remote Tart image, fetched ONCE at    [ghcr.io/cirruslabs/macos-tahoe-xcode:26.5]
+#                   install time and materialised as a
+#                   local VM. Must be pinned to a version
+#                   tag — ":latest" is refused (a moving
+#                   tag rolls the fleet silently and
+#                   defeats the pin-as-audit-trail).
+#   BASE_IMAGE      Name of an EXISTING local Tart VM to  [derived: base-<image>-<tag>]
+#                   run from instead of pulling
+#                   SOURCE_IMAGE — for images that arrive
+#                   out of band (rsync'd from another
+#                   host, built with Packer). See "Base
+#                   image model" below.
+#   REGISTRY_USER   Credentials for `tart login` when     [""]
+#   REGISTRY_PAT    SOURCE_IMAGE lives in a private
+#                   registry (e.g. a GHCR PAT with
+#                   read:packages). Both set → login runs
+#                   before the pull; otherwise skipped.
+#   RUNNER_VERSION  actions/runner version installed      [2.335.1]
+#                   inside VMs whose image doesn't bake
+#                   one (~/actions-runner present → this
+#                   is never used). Bump when GitHub
+#                   deprecates the pinned release.
 #   VM_MEMORY_MB    Per-VM memory                         [10240]
 #   VM_CPU_COUNT    Per-VM CPUs                           [4]
-#   VM_DISK_GB      Per-VM disk (GB)                      [120]
+#   VM_DISK_GB      Per-VM disk (GB); empty = keep the    [""]
+#                   image's disk. Applied only when it
+#                   would GROW the disk — Tart cannot
+#                   shrink one, and asking errors.
 #   HOST_RESERVE_MB Memory to keep free for the host OS   [6144]
 #                   When multiple orchestrators run on
 #                   one host, each waits until host has
@@ -39,6 +67,17 @@
 #                   64 GB host fits 5+ concurrent VMs.
 #   LAUNCHD_LABEL   launchd job label                     [dev.<lowercased-GH_ORG>.gha-runner]
 #   CONFIG_DIR      Where to stash config + scripts       [~/.gha-runner]
+#
+# Base image model:
+#   The remote image is materialised ONCE as a local Tart VM
+#   (~/.tart/vms/<BASE_IMAGE>) and config.env records the LOCAL name — the
+#   per-job `tart clone` never consults a registry. When the per-job path
+#   cloned a remote ref instead, the image lived in Tart's OCI cache, which
+#   auto-prunes under disk pressure; on a 256 GB host that degenerated into
+#   re-downloading the full image on EVERY cycle (observed: 64 GB × 398
+#   pulls ≈ 27 TB, ~55 min/cycle, runner offline ~95% of the time). Local
+#   VMs are never auto-pruned, and per-job clones are APFS copy-on-write —
+#   cycles cost seconds and ~zero extra disk.
 #
 # Re-running is idempotent — the runner group + repo scoping are no-op on
 # the second pass, the orchestrator + plist are overwritten with the same
@@ -91,11 +130,16 @@ __main__() {
   RUNNER_GROUP="${RUNNER_GROUP:-macos-runners}"
   SHARED_LABEL="${SHARED_LABEL:-macos-runner}"
   HOST_LABEL="${HOST_LABEL:-$(hostname -s | tr '[:upper:]' '[:lower:]')}"
+  EXTRA_LABELS="${EXTRA_LABELS:-}"
   SCOPE_REPO="${SCOPE_REPO:-}"
-  BASE_IMAGE="${BASE_IMAGE:-ghcr.io/cirruslabs/macos-tahoe-xcode:latest}"
+  REGISTRY_USER="${REGISTRY_USER:-}"
+  REGISTRY_PAT="${REGISTRY_PAT:-}"
+  RUNNER_VERSION="${RUNNER_VERSION:-2.335.1}"
+  SOURCE_IMAGE="${SOURCE_IMAGE:-ghcr.io/cirruslabs/macos-tahoe-xcode:26.5}"
+  BASE_IMAGE="${BASE_IMAGE:-}"
   VM_MEMORY_MB="${VM_MEMORY_MB:-10240}"
   VM_CPU_COUNT="${VM_CPU_COUNT:-4}"
-  VM_DISK_GB="${VM_DISK_GB:-120}"
+  VM_DISK_GB="${VM_DISK_GB:-}"
   HOST_RESERVE_MB="${HOST_RESERVE_MB:-6144}"
   LAUNCHD_LABEL="${LAUNCHD_LABEL:-dev.$ORG_LOWER.gha-runner}"
   CONFIG_DIR="${CONFIG_DIR:-$HOME/.gha-runner}"
@@ -146,10 +190,71 @@ __main__() {
   fi
 
   # -----------------------------------------------------------------------
-  # Base image
+  # Base image → a LOCAL Tart VM (config.env never records a remote ref)
   # -----------------------------------------------------------------------
-  step "Pulling base image: $BASE_IMAGE"
-  tart pull "$BASE_IMAGE"
+  # The orchestrator clones from a LOCAL VM name. A remote ref would make
+  # every cycle consult the registry, and remote images live in Tart's OCI
+  # cache, which auto-prunes under disk pressure — on a small SSD that turns
+  # into re-downloading the full image on EVERY cycle (see "Base image
+  # model" in the header). Local VMs under ~/.tart/vms are never auto-pruned;
+  # per-job clones are APFS copy-on-write.
+  if [[ -n "$BASE_IMAGE" ]]; then
+    if [[ "$BASE_IMAGE" == */* || "$BASE_IMAGE" == *:* ]]; then
+      echo "ERROR: BASE_IMAGE must name an existing LOCAL tart VM (got: $BASE_IMAGE)" >&2
+      echo "       For a remote image, pass SOURCE_IMAGE instead." >&2
+      exit 1
+    fi
+    step "Using existing local base VM: $BASE_IMAGE"
+    if ! tart list --format json | jq -e --arg n "$BASE_IMAGE" \
+        '.[] | select(.Source=="local" and .Name==$n)' >/dev/null; then
+      echo "ERROR: local VM '$BASE_IMAGE' not found — rsync/build it first, or unset" >&2
+      echo "       BASE_IMAGE to pull SOURCE_IMAGE instead." >&2
+      exit 1
+    fi
+    # Image arrived out of band — don't record a misleading provenance.
+    SOURCE_IMAGE=""
+  else
+    local src_tag
+    src_tag="${SOURCE_IMAGE##*:}"
+    if [[ "$SOURCE_IMAGE" != *:* || "$src_tag" == "latest" || "$src_tag" == */* ]]; then
+      echo "ERROR: SOURCE_IMAGE must be pinned to a version tag (got: $SOURCE_IMAGE)" >&2
+      echo "       ':latest' moves under the fleet — the pinned tag is the audit trail." >&2
+      exit 1
+    fi
+    BASE_IMAGE="base-$(basename "${SOURCE_IMAGE%:*}")-${src_tag}"
+    if tart list --format json | jq -e --arg n "$BASE_IMAGE" \
+        '.[] | select(.Source=="local" and .Name==$n)' >/dev/null; then
+      step "Local base VM $BASE_IMAGE already present — skipping download"
+    else
+      # Disk preflight: the expanded image lands on this volume, and thin
+      # headroom is exactly what produced the cache-thrash death spiral this
+      # script's local-image model exists to prevent. Fail on hopeless, warn
+      # on tight.
+      local free_gb
+      free_gb="$(df -g / | awk 'NR==2 {print $4}')"
+      if [[ "$free_gb" -lt 40 ]]; then
+        echo "ERROR: only ${free_gb} GB free on / — not pulling a macOS image into that." >&2
+        echo "       Free disk (or use a smaller SOURCE_IMAGE) and re-run." >&2
+        exit 1
+      elif [[ "$free_gb" -lt 120 ]]; then
+        echo "WARNING: ${free_gb} GB free on / — a full Xcode image expands to ~90 GB" >&2
+        echo "         and ephemeral clone write-deltas need headroom on top." >&2
+      fi
+      if [[ -n "$REGISTRY_USER" && -n "$REGISTRY_PAT" ]]; then
+        step "tart login ${SOURCE_IMAGE%%/*}"
+        printf '%s' "$REGISTRY_PAT" | tart login "${SOURCE_IMAGE%%/*}" \
+          --username "$REGISTRY_USER" --password-stdin
+      fi
+      step "Materialising $SOURCE_IMAGE as local VM $BASE_IMAGE (one-time download)"
+      tart clone "$SOURCE_IMAGE" "$BASE_IMAGE"
+    fi
+  fi
+  # The orchestrator reaps every VM whose name starts with "ephem-"; the base
+  # VM must never be eligible.
+  if [[ "$BASE_IMAGE" == ephem-* ]]; then
+    echo "ERROR: base VM name must not start with 'ephem-' (the orchestrator reaps those)" >&2
+    exit 1
+  fi
 
   # -----------------------------------------------------------------------
   # Runner group + repo scoping
@@ -199,12 +304,18 @@ GH_PAT="$GH_PAT"
 RUNNER_GROUP="$RUNNER_GROUP"
 SHARED_LABEL="$SHARED_LABEL"
 HOST_LABEL="$HOST_LABEL"
+EXTRA_LABELS="$EXTRA_LABELS"
 SCOPE_REPO="$SCOPE_REPO"
+# BASE_IMAGE is a LOCAL tart VM name — never a remote ref (see "Base image
+# model" in the setup script header). SOURCE_IMAGE records provenance only;
+# it is empty when the base VM arrived out of band.
 BASE_IMAGE="$BASE_IMAGE"
+SOURCE_IMAGE="$SOURCE_IMAGE"
 VM_MEMORY_MB="$VM_MEMORY_MB"
 VM_CPU_COUNT="$VM_CPU_COUNT"
 VM_DISK_GB="$VM_DISK_GB"
 HOST_RESERVE_MB="$HOST_RESERVE_MB"
+RUNNER_VERSION="$RUNNER_VERSION"
 EOF
   chmod 600 "$CONFIG_FILE"
 
@@ -215,8 +326,10 @@ EOF
   cat > "$ORCH_SCRIPT" <<'ORCHESTRATOR_EOF'
 #!/usr/bin/env bash
 # Ephemeral Tart GHA runner orchestrator. Generated by mac-runner-setup.sh.
-# Loops: clone base image → boot VM → install runner inside VM →
-# register JIT ephemeral runner → run one job → destroy VM.
+# Loops: clone base image → boot VM → wait for ssh → register JIT ephemeral
+# runner → run one job → destroy VM. Registration happens only after the VM
+# is reachable, so runners never sit "offline" in GitHub during boot and a
+# boot failure can't strand a registration.
 
 set -uo pipefail
 
@@ -238,11 +351,18 @@ gh_api() {
 }
 
 ssh_vm() {
+  # Force password auth (sshpass supplies it). Without this, ssh offers every
+  # key in the host's ssh-agent first and trips the guest sshd's MaxAuthTries
+  # → "Too many authentication failures" before the password is ever tried.
   sshpass -p admin ssh \
     -o StrictHostKeyChecking=no \
     -o UserKnownHostsFile=/dev/null \
     -o ServerAliveInterval=30 \
     -o LogLevel=ERROR \
+    -o PreferredAuthentications=password \
+    -o PubkeyAuthentication=no \
+    -o IdentitiesOnly=yes \
+    -o NumberOfPasswordPrompts=1 \
     "admin@$1" "${@:2}"
 }
 
@@ -301,9 +421,18 @@ host_total_mb() {
   echo "$(( $(sysctl -n hw.memsize) / 1024 / 1024 ))"
 }
 running_vm_mem_mb() {
-  tart list --format json 2>/dev/null \
-    | jq -r '[.[]? | select(.State=="running") | .Memory // 0] | add // 0' \
-    || echo 0
+  # `tart list --format json` no longer reports Memory (tart 2.x emits only
+  # Accessed/Disk/Name/Running/Size/Source/State), which silently zeroed this
+  # sum and let every orchestrator boot at once. `tart get <vm>` still
+  # reports the configured Memory (MB) — ask it per running VM.
+  local total=0 m vm
+  while read -r vm; do
+    [[ -n "$vm" ]] || continue
+    m="$(tart get "$vm" --format json 2>/dev/null | jq -r '.Memory // 0')"
+    total=$(( total + ${m:-0} ))
+  done < <(tart list --format json 2>/dev/null \
+             | jq -r '.[]? | select(.State=="running") | .Name')
+  echo "$total"
 }
 wait_for_ram_capacity() {
   local total free needed
@@ -329,6 +458,9 @@ reap_orphans() {
 }
 reap_orphans
 reap_pending_runners
+# Per-VM console logs: the happy path deletes its own; failures keep theirs
+# for post-mortems. Don't let those accumulate forever.
+find "$CONFIG_DIR" -name 'vm-ephem-*.log' -mtime +7 -delete 2>/dev/null || true
 
 while true; do
   release_current_runner
@@ -336,50 +468,24 @@ while true; do
   runner_name="$HOST_LABEL-$(date +%s)"
   log "spawning vm=$vm_name runner=$runner_name"
 
-  GROUP_ID="$(fetch_group_id)"
-  if [[ -z "$GROUP_ID" || "$GROUP_ID" == "null" ]]; then
-    log "ERROR: runner group '$RUNNER_GROUP' not found"
-    sleep 60; continue
-  fi
-
-  # JIT-registered runners don't auto-apply the platform labels that
-  # ./config.sh normally would (self-hosted / macOS / arm64). The
-  # `labels` field passed to generate-jitconfig is the COMPLETE set,
-  # so include them explicitly — otherwise workflows that ask for
-  # `[self-hosted, macos-26]` won't match this runner.
-  labels_json="$(jq -nc --arg s "$SHARED_LABEL" --arg h "$HOST_LABEL" \
-    '["self-hosted", "macOS", "arm64", $s, $h]')"
-  jit_body="$(jq -nc \
-    --arg name "$runner_name" \
-    --argjson group_id "$GROUP_ID" \
-    --argjson labels "$labels_json" \
-    '{name:$name, runner_group_id:$group_id, labels:$labels, work_folder:"_work"}')"
-  jit_response="$(gh_api -X POST \
-    "https://api.github.com/orgs/$GH_ORG/actions/runners/generate-jitconfig" \
-    -d "$jit_body")" || {
-    log "ERROR: generate-jitconfig failed"
-    sleep 30; continue
-  }
-  jitconfig="$(echo "$jit_response" | jq -r .encoded_jit_config)"
-  if [[ -z "$jitconfig" || "$jitconfig" == "null" ]]; then
-    log "ERROR: empty JIT config from API"
-    sleep 30; continue
-  fi
-
-  # generate-jitconfig returns the runner's id; record it so a reboot mid-job
-  # doesn't strand the registration (reaped by reap_pending_runners at boot).
-  runner_id="$(echo "$jit_response" | jq -r '.runner.id')"
-  [[ "$runner_id" == "null" ]] && runner_id=""
-  CURRENT_RUNNER_ID="$runner_id"
-  ledger_add "$runner_id"
-
   if ! tart clone "$BASE_IMAGE" "$vm_name"; then
     log "ERROR: tart clone failed"; sleep 30; continue
   fi
   tart set "$vm_name" \
     --memory "$VM_MEMORY_MB" \
-    --cpu "$VM_CPU_COUNT" \
-    --disk-size "$VM_DISK_GB" >/dev/null
+    --cpu "$VM_CPU_COUNT" >/dev/null
+  # Tart can only GROW a disk — the cirruslabs xcode images already ship a
+  # 140 GB disk, and asking for less errors ("new disk size should be larger
+  # than the current disk size") on every single cycle. Apply VM_DISK_GB only
+  # when set and strictly larger than what the clone already has; clones are
+  # APFS copy-on-write, so a bigger number costs nothing until written to.
+  if [[ -n "${VM_DISK_GB:-}" ]]; then
+    current_disk="$(tart list --format json \
+      | jq -r --arg n "$vm_name" '.[] | select(.Name==$n) | .Disk // 0')"
+    if [[ "$VM_DISK_GB" -gt "${current_disk:-0}" ]]; then
+      tart set "$vm_name" --disk-size "$VM_DISK_GB" >/dev/null
+    fi
+  fi
 
   # Block until the host has RAM for this VM (auto-scales
   # concurrency across orchestrators based on host capacity).
@@ -399,26 +505,85 @@ while true; do
     log "ERROR: vm never got an IP"; cleanup_vm "$vm_name"; sleep 30; continue
   fi
   log "vm $vm_name @ $vm_ip — waiting for sshd"
+  ssh_ok=""
   for _ in $(seq 1 60); do
-    ssh_vm "$vm_ip" "true" >/dev/null 2>&1 && break
+    ssh_vm "$vm_ip" "true" >/dev/null 2>&1 && { ssh_ok=1; break; }
     sleep 2
   done
+  if [[ -z "$ssh_ok" ]]; then
+    log "ERROR: sshd never came up"; cleanup_vm "$vm_name"; sleep 30; continue
+  fi
 
-  ssh_vm "$vm_ip" "bash -s -- '$jitconfig'" <<'INVMEOF'
+  # Register the runner only now that the VM can actually take a job.
+  # Minting the JIT config before boot left a runner visible-but-offline in
+  # GitHub for the whole boot window (a slow cycle reads as a dead host in
+  # the runners UI), and a boot failure stranded a registration that had to
+  # be reaped later. Registered here, the offline window is the seconds
+  # between this call and run.sh connecting.
+  GROUP_ID="$(fetch_group_id)"
+  if [[ -z "$GROUP_ID" || "$GROUP_ID" == "null" ]]; then
+    log "ERROR: runner group '$RUNNER_GROUP' not found"
+    cleanup_vm "$vm_name"; sleep 60; continue
+  fi
+
+  # JIT-registered runners don't auto-apply the platform labels that
+  # ./config.sh normally would (self-hosted / macOS / arm64). The
+  # `labels` field passed to generate-jitconfig is the COMPLETE set,
+  # so include them explicitly — otherwise workflows that ask for
+  # `[self-hosted, macos-26]` won't match this runner. EXTRA_LABELS
+  # (comma-separated) advertises image capabilities (e.g.
+  # mobile-runner,xcode-26.6) so capability-gated workflows can route here.
+  labels_json="$(jq -nc --arg s "$SHARED_LABEL" --arg h "$HOST_LABEL" \
+    --arg x "${EXTRA_LABELS:-}" \
+    '["self-hosted", "macOS", "arm64", $s, $h]
+     + ($x | split(",") | map(select(length > 0)))')"
+  jit_body="$(jq -nc \
+    --arg name "$runner_name" \
+    --argjson group_id "$GROUP_ID" \
+    --argjson labels "$labels_json" \
+    '{name:$name, runner_group_id:$group_id, labels:$labels, work_folder:"_work"}')"
+  jit_response="$(gh_api -X POST \
+    "https://api.github.com/orgs/$GH_ORG/actions/runners/generate-jitconfig" \
+    -d "$jit_body")" || {
+    log "ERROR: generate-jitconfig failed"
+    cleanup_vm "$vm_name"; sleep 30; continue
+  }
+  jitconfig="$(echo "$jit_response" | jq -r .encoded_jit_config)"
+  if [[ -z "$jitconfig" || "$jitconfig" == "null" ]]; then
+    log "ERROR: empty JIT config from API"
+    cleanup_vm "$vm_name"; sleep 30; continue
+  fi
+
+  # generate-jitconfig returns the runner's id; record it so a reboot mid-job
+  # doesn't strand the registration (reaped by reap_pending_runners at boot).
+  runner_id="$(echo "$jit_response" | jq -r '.runner.id')"
+  [[ "$runner_id" == "null" ]] && runner_id=""
+  CURRENT_RUNNER_ID="$runner_id"
+  ledger_add "$runner_id"
+
+  ssh_vm "$vm_ip" "bash -s -- '$jitconfig' '${RUNNER_VERSION:-}'" <<'INVMEOF'
 set -euo pipefail
 JITCONFIG="$1"
+RUNNER_VERSION="${2:-}"
 cd "$HOME"
 
-runner_version="$(curl -fsS https://api.github.com/repos/actions/runner/releases/latest \
-  | sed -n 's/.*"tag_name": "v\([^"]*\)".*/\1/p' | head -1)"
-if [[ -z "$runner_version" ]]; then
-  echo "ERROR: could not resolve runner version" >&2
-  exit 1
-fi
+# Toolchain-baked images export their PATH in ~/.zprofile (node, JDK,
+# Android SDK, Maestro, …). Source it so the runner — and every job step it
+# spawns — inherits the image's toolchain the way a login shell would.
+# shellcheck disable=SC1090
+source ~/.zprofile 2>/dev/null || true
 
+# Images that bake ~/actions-runner (e.g. Packer-built CI images) skip this
+# entirely. The fallback installs the PINNED version — resolving "latest"
+# via an unauthenticated API call per job is rate-limitable and lets the
+# runner drift under the fleet.
 if [[ ! -x ~/actions-runner/run.sh ]]; then
+  if [[ -z "$RUNNER_VERSION" ]]; then
+    echo "ERROR: image bakes no runner and RUNNER_VERSION is unset" >&2
+    exit 1
+  fi
   mkdir -p ~/actions-runner && cd ~/actions-runner
-  url="https://github.com/actions/runner/releases/download/v$runner_version/actions-runner-osx-arm64-$runner_version.tar.gz"
+  url="https://github.com/actions/runner/releases/download/v$RUNNER_VERSION/actions-runner-osx-arm64-$RUNNER_VERSION.tar.gz"
   curl -fsSL -o runner.tar.gz "$url"
   tar xzf runner.tar.gz
   rm runner.tar.gz
@@ -435,6 +600,10 @@ INVMEOF
   if [[ "$exit_code" -ne 0 ]]; then
     log "backoff 30s on non-zero exit"
     sleep 30
+  else
+    # Clean cycle → its console log holds nothing worth keeping. Failed
+    # cycles keep theirs; the startup sweep ages those out after 7 days.
+    rm -f "$CONFIG_DIR/vm-$vm_name.log"
   fi
 done
 ORCHESTRATOR_EOF
@@ -484,8 +653,20 @@ PLIST_EOF
   # -----------------------------------------------------------------------
   # Done
   # -----------------------------------------------------------------------
+  local other_bases
+  other_bases="$(tart list --format json | jq -r --arg n "$BASE_IMAGE" \
+    '.[] | select(.Source=="local") | .Name | select(startswith("base-") and . != $n)' \
+    | tr '\n' ' ')"
+
   step "Setup complete"
   cat <<NEXT
+
+Base image:
+  • Runner clones from local VM: $BASE_IMAGE
+  • To roll a new image: re-run this script with a new pinned SOURCE_IMAGE
+    (or stage a local VM out of band and pass BASE_IMAGE=<name>). The old
+    base VM is left in place — delete it after the first green cycle on the
+    new image:  tart delete <old-base>
 
 Service:
   • Label:      $LAUNCHD_LABEL
@@ -504,7 +685,7 @@ Surviving reboots:
 
 GitHub:
   • Each job spawns a fresh runner with labels:
-      self-hosted, macOS, arm64 (auto) + $SHARED_LABEL + $HOST_LABEL
+      self-hosted, macOS, arm64 (auto) + $SHARED_LABEL + $HOST_LABEL${EXTRA_LABELS:+ + $EXTRA_LABELS}
 
 Workflow usage:
   runs-on: [self-hosted, $SHARED_LABEL]    # any host in the fleet
@@ -514,6 +695,15 @@ Adding another host:
   Run this script on the new machine with HOST_LABEL=<name>. Same
   GH_ORG + RUNNER_GROUP + SHARED_LABEL → joins the same fleet.
 NEXT
+
+  if [[ -n "${other_bases// /}" ]]; then
+    cat <<OLDBASES
+Old base VMs still on disk (delete after the first green cycle on the
+current image — each holds tens of GB):
+  ${other_bases}
+  tart delete <name>
+OLDBASES
+  fi
 }
 
 __main__ "$@"
