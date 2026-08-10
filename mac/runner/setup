@@ -561,7 +561,7 @@ while true; do
   CURRENT_RUNNER_ID="$runner_id"
   ledger_add "$runner_id"
 
-  ssh_vm "$vm_ip" "bash -s -- '$jitconfig' '$RUNNER_VERSION'" <<'INVMEOF'
+  ssh_vm "$vm_ip" "bash -s -- '$jitconfig' '${RUNNER_VERSION:-}'" <<'INVMEOF'
 set -euo pipefail
 JITCONFIG="$1"
 RUNNER_VERSION="${2:-}"
