@@ -26,10 +26,24 @@
 #   HOST_LABEL      Per-host label (this machine)         [<hostname -s, lowercased>]
 #   SCOPE_REPO      "owner/repo" to gate the group to;    [""]
 #                   empty = org-wide (any repo in org may use these runners)
-#   BASE_IMAGE      Tart base image                       [ghcr.io/cirruslabs/macos-tahoe-xcode:latest]
+#   SOURCE_IMAGE    Remote Tart image, fetched ONCE at    [ghcr.io/cirruslabs/macos-tahoe-xcode:26.5]
+#                   install time and materialised as a
+#                   local VM. Must be pinned to a version
+#                   tag — ":latest" is refused (a moving
+#                   tag rolls the fleet silently and
+#                   defeats the pin-as-audit-trail).
+#   BASE_IMAGE      Name of an EXISTING local Tart VM to  [derived: base-<image>-<tag>]
+#                   run from instead of pulling
+#                   SOURCE_IMAGE — for images that arrive
+#                   out of band (rsync'd from another
+#                   host, built with Packer). See "Base
+#                   image model" below.
 #   VM_MEMORY_MB    Per-VM memory                         [10240]
 #   VM_CPU_COUNT    Per-VM CPUs                           [4]
-#   VM_DISK_GB      Per-VM disk (GB)                      [120]
+#   VM_DISK_GB      Per-VM disk (GB); empty = keep the    [""]
+#                   image's disk. Applied only when it
+#                   would GROW the disk — Tart cannot
+#                   shrink one, and asking errors.
 #   HOST_RESERVE_MB Memory to keep free for the host OS   [6144]
 #                   When multiple orchestrators run on
 #                   one host, each waits until host has
@@ -39,6 +53,17 @@
 #                   64 GB host fits 5+ concurrent VMs.
 #   LAUNCHD_LABEL   launchd job label                     [dev.<lowercased-GH_ORG>.gha-runner]
 #   CONFIG_DIR      Where to stash config + scripts       [~/.gha-runner]
+#
+# Base image model:
+#   The remote image is materialised ONCE as a local Tart VM
+#   (~/.tart/vms/<BASE_IMAGE>) and config.env records the LOCAL name — the
+#   per-job `tart clone` never consults a registry. When the per-job path
+#   cloned a remote ref instead, the image lived in Tart's OCI cache, which
+#   auto-prunes under disk pressure; on a 256 GB host that degenerated into
+#   re-downloading the full image on EVERY cycle (observed: 64 GB × 398
+#   pulls ≈ 27 TB, ~55 min/cycle, runner offline ~95% of the time). Local
+#   VMs are never auto-pruned, and per-job clones are APFS copy-on-write —
+#   cycles cost seconds and ~zero extra disk.
 #
 # Re-running is idempotent — the runner group + repo scoping are no-op on
 # the second pass, the orchestrator + plist are overwritten with the same
@@ -92,10 +117,11 @@ __main__() {
   SHARED_LABEL="${SHARED_LABEL:-macos-runner}"
   HOST_LABEL="${HOST_LABEL:-$(hostname -s | tr '[:upper:]' '[:lower:]')}"
   SCOPE_REPO="${SCOPE_REPO:-}"
-  BASE_IMAGE="${BASE_IMAGE:-ghcr.io/cirruslabs/macos-tahoe-xcode:latest}"
+  SOURCE_IMAGE="${SOURCE_IMAGE:-ghcr.io/cirruslabs/macos-tahoe-xcode:26.5}"
+  BASE_IMAGE="${BASE_IMAGE:-}"
   VM_MEMORY_MB="${VM_MEMORY_MB:-10240}"
   VM_CPU_COUNT="${VM_CPU_COUNT:-4}"
-  VM_DISK_GB="${VM_DISK_GB:-120}"
+  VM_DISK_GB="${VM_DISK_GB:-}"
   HOST_RESERVE_MB="${HOST_RESERVE_MB:-6144}"
   LAUNCHD_LABEL="${LAUNCHD_LABEL:-dev.$ORG_LOWER.gha-runner}"
   CONFIG_DIR="${CONFIG_DIR:-$HOME/.gha-runner}"
@@ -146,10 +172,52 @@ __main__() {
   fi
 
   # -----------------------------------------------------------------------
-  # Base image
+  # Base image → a LOCAL Tart VM (config.env never records a remote ref)
   # -----------------------------------------------------------------------
-  step "Pulling base image: $BASE_IMAGE"
-  tart pull "$BASE_IMAGE"
+  # The orchestrator clones from a LOCAL VM name. A remote ref would make
+  # every cycle consult the registry, and remote images live in Tart's OCI
+  # cache, which auto-prunes under disk pressure — on a small SSD that turns
+  # into re-downloading the full image on EVERY cycle (see "Base image
+  # model" in the header). Local VMs under ~/.tart/vms are never auto-pruned;
+  # per-job clones are APFS copy-on-write.
+  if [[ -n "$BASE_IMAGE" ]]; then
+    if [[ "$BASE_IMAGE" == */* || "$BASE_IMAGE" == *:* ]]; then
+      echo "ERROR: BASE_IMAGE must name an existing LOCAL tart VM (got: $BASE_IMAGE)" >&2
+      echo "       For a remote image, pass SOURCE_IMAGE instead." >&2
+      exit 1
+    fi
+    step "Using existing local base VM: $BASE_IMAGE"
+    if ! tart list --format json | jq -e --arg n "$BASE_IMAGE" \
+        '.[] | select(.Source=="local" and .Name==$n)' >/dev/null; then
+      echo "ERROR: local VM '$BASE_IMAGE' not found — rsync/build it first, or unset" >&2
+      echo "       BASE_IMAGE to pull SOURCE_IMAGE instead." >&2
+      exit 1
+    fi
+    # Image arrived out of band — don't record a misleading provenance.
+    SOURCE_IMAGE=""
+  else
+    local src_tag
+    src_tag="${SOURCE_IMAGE##*:}"
+    if [[ "$SOURCE_IMAGE" != *:* || "$src_tag" == "latest" || "$src_tag" == */* ]]; then
+      echo "ERROR: SOURCE_IMAGE must be pinned to a version tag (got: $SOURCE_IMAGE)" >&2
+      echo "       ':latest' moves under the fleet — the pinned tag is the audit trail." >&2
+      exit 1
+    fi
+    BASE_IMAGE="base-$(basename "${SOURCE_IMAGE%:*}")-${src_tag}"
+    if tart list --format json | jq -e --arg n "$BASE_IMAGE" \
+        '.[] | select(.Source=="local" and .Name==$n)' >/dev/null; then
+      step "Local base VM $BASE_IMAGE already present — skipping download"
+    else
+      step "Materialising $SOURCE_IMAGE as local VM $BASE_IMAGE (one-time download)"
+      tart clone "$SOURCE_IMAGE" "$BASE_IMAGE"
+    fi
+  fi
+  # The orchestrator reaps every VM whose name starts with "ephem-"; the base
+  # VM must never be eligible.
+  if [[ "$BASE_IMAGE" == ephem-* ]]; then
+    echo "ERROR: base VM name must not start with 'ephem-' (the orchestrator reaps those)" >&2
+    exit 1
+  fi
 
   # -----------------------------------------------------------------------
   # Runner group + repo scoping
@@ -200,7 +268,11 @@ RUNNER_GROUP="$RUNNER_GROUP"
 SHARED_LABEL="$SHARED_LABEL"
 HOST_LABEL="$HOST_LABEL"
 SCOPE_REPO="$SCOPE_REPO"
+# BASE_IMAGE is a LOCAL tart VM name — never a remote ref (see "Base image
+# model" in the setup script header). SOURCE_IMAGE records provenance only;
+# it is empty when the base VM arrived out of band.
 BASE_IMAGE="$BASE_IMAGE"
+SOURCE_IMAGE="$SOURCE_IMAGE"
 VM_MEMORY_MB="$VM_MEMORY_MB"
 VM_CPU_COUNT="$VM_CPU_COUNT"
 VM_DISK_GB="$VM_DISK_GB"
@@ -238,11 +310,18 @@ gh_api() {
 }
 
 ssh_vm() {
+  # Force password auth (sshpass supplies it). Without this, ssh offers every
+  # key in the host's ssh-agent first and trips the guest sshd's MaxAuthTries
+  # → "Too many authentication failures" before the password is ever tried.
   sshpass -p admin ssh \
     -o StrictHostKeyChecking=no \
     -o UserKnownHostsFile=/dev/null \
     -o ServerAliveInterval=30 \
     -o LogLevel=ERROR \
+    -o PreferredAuthentications=password \
+    -o PubkeyAuthentication=no \
+    -o IdentitiesOnly=yes \
+    -o NumberOfPasswordPrompts=1 \
     "admin@$1" "${@:2}"
 }
 
@@ -378,8 +457,19 @@ while true; do
   fi
   tart set "$vm_name" \
     --memory "$VM_MEMORY_MB" \
-    --cpu "$VM_CPU_COUNT" \
-    --disk-size "$VM_DISK_GB" >/dev/null
+    --cpu "$VM_CPU_COUNT" >/dev/null
+  # Tart can only GROW a disk — the cirruslabs xcode images already ship a
+  # 140 GB disk, and asking for less errors ("new disk size should be larger
+  # than the current disk size") on every single cycle. Apply VM_DISK_GB only
+  # when set and strictly larger than what the clone already has; clones are
+  # APFS copy-on-write, so a bigger number costs nothing until written to.
+  if [[ -n "${VM_DISK_GB:-}" ]]; then
+    current_disk="$(tart list --format json \
+      | jq -r --arg n "$vm_name" '.[] | select(.Name==$n) | .Disk // 0')"
+    if [[ "$VM_DISK_GB" -gt "${current_disk:-0}" ]]; then
+      tart set "$vm_name" --disk-size "$VM_DISK_GB" >/dev/null
+    fi
+  fi
 
   # Block until the host has RAM for this VM (auto-scales
   # concurrency across orchestrators based on host capacity).
