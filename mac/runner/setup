@@ -24,6 +24,10 @@
 #   RUNNER_GROUP    Org-level runner group name           [macos-runners]
 #   SHARED_LABEL    Fleet label all runners carry         [macos-runner]
 #   HOST_LABEL      Per-host label (this machine)         [<hostname -s, lowercased>]
+#   EXTRA_LABELS    Comma-separated extra labels appended [""]
+#                   to every runner registration (e.g.
+#                   "mobile-runner,xcode-26.6" when the
+#                   image carries a mobile toolchain).
 #   SCOPE_REPO      "owner/repo" to gate the group to;    [""]
 #                   empty = org-wide (any repo in org may use these runners)
 #   SOURCE_IMAGE    Remote Tart image, fetched ONCE at    [ghcr.io/cirruslabs/macos-tahoe-xcode:26.5]
@@ -38,6 +42,11 @@
 #                   out of band (rsync'd from another
 #                   host, built with Packer). See "Base
 #                   image model" below.
+#   REGISTRY_USER   Credentials for `tart login` when     [""]
+#   REGISTRY_PAT    SOURCE_IMAGE lives in a private
+#                   registry (e.g. a GHCR PAT with
+#                   read:packages). Both set → login runs
+#                   before the pull; otherwise skipped.
 #   VM_MEMORY_MB    Per-VM memory                         [10240]
 #   VM_CPU_COUNT    Per-VM CPUs                           [4]
 #   VM_DISK_GB      Per-VM disk (GB); empty = keep the    [""]
@@ -116,7 +125,10 @@ __main__() {
   RUNNER_GROUP="${RUNNER_GROUP:-macos-runners}"
   SHARED_LABEL="${SHARED_LABEL:-macos-runner}"
   HOST_LABEL="${HOST_LABEL:-$(hostname -s | tr '[:upper:]' '[:lower:]')}"
+  EXTRA_LABELS="${EXTRA_LABELS:-}"
   SCOPE_REPO="${SCOPE_REPO:-}"
+  REGISTRY_USER="${REGISTRY_USER:-}"
+  REGISTRY_PAT="${REGISTRY_PAT:-}"
   SOURCE_IMAGE="${SOURCE_IMAGE:-ghcr.io/cirruslabs/macos-tahoe-xcode:26.5}"
   BASE_IMAGE="${BASE_IMAGE:-}"
   VM_MEMORY_MB="${VM_MEMORY_MB:-10240}"
@@ -208,6 +220,11 @@ __main__() {
         '.[] | select(.Source=="local" and .Name==$n)' >/dev/null; then
       step "Local base VM $BASE_IMAGE already present — skipping download"
     else
+      if [[ -n "$REGISTRY_USER" && -n "$REGISTRY_PAT" ]]; then
+        step "tart login ${SOURCE_IMAGE%%/*}"
+        printf '%s' "$REGISTRY_PAT" | tart login "${SOURCE_IMAGE%%/*}" \
+          --username "$REGISTRY_USER" --password-stdin
+      fi
       step "Materialising $SOURCE_IMAGE as local VM $BASE_IMAGE (one-time download)"
       tart clone "$SOURCE_IMAGE" "$BASE_IMAGE"
     fi
@@ -267,6 +284,7 @@ GH_PAT="$GH_PAT"
 RUNNER_GROUP="$RUNNER_GROUP"
 SHARED_LABEL="$SHARED_LABEL"
 HOST_LABEL="$HOST_LABEL"
+EXTRA_LABELS="$EXTRA_LABELS"
 SCOPE_REPO="$SCOPE_REPO"
 # BASE_IMAGE is a LOCAL tart VM name — never a remote ref (see "Base image
 # model" in the setup script header). SOURCE_IMAGE records provenance only;
@@ -425,9 +443,13 @@ while true; do
   # ./config.sh normally would (self-hosted / macOS / arm64). The
   # `labels` field passed to generate-jitconfig is the COMPLETE set,
   # so include them explicitly — otherwise workflows that ask for
-  # `[self-hosted, macos-26]` won't match this runner.
+  # `[self-hosted, macos-26]` won't match this runner. EXTRA_LABELS
+  # (comma-separated) advertises image capabilities (e.g.
+  # mobile-runner,xcode-26.6) so capability-gated workflows can route here.
   labels_json="$(jq -nc --arg s "$SHARED_LABEL" --arg h "$HOST_LABEL" \
-    '["self-hosted", "macOS", "arm64", $s, $h]')"
+    --arg x "${EXTRA_LABELS:-}" \
+    '["self-hosted", "macOS", "arm64", $s, $h]
+     + ($x | split(",") | map(select(length > 0)))')"
   jit_body="$(jq -nc \
     --arg name "$runner_name" \
     --argjson group_id "$GROUP_ID" \
@@ -498,6 +520,12 @@ while true; do
 set -euo pipefail
 JITCONFIG="$1"
 cd "$HOME"
+
+# Toolchain-baked images export their PATH in ~/.zprofile (node, JDK,
+# Android SDK, Maestro, …). Source it so the runner — and every job step it
+# spawns — inherits the image's toolchain the way a login shell would.
+# shellcheck disable=SC1090
+source ~/.zprofile 2>/dev/null || true
 
 runner_version="$(curl -fsS https://api.github.com/repos/actions/runner/releases/latest \
   | sed -n 's/.*"tag_name": "v\([^"]*\)".*/\1/p' | head -1)"
@@ -594,7 +622,7 @@ Surviving reboots:
 
 GitHub:
   • Each job spawns a fresh runner with labels:
-      self-hosted, macOS, arm64 (auto) + $SHARED_LABEL + $HOST_LABEL
+      self-hosted, macOS, arm64 (auto) + $SHARED_LABEL + $HOST_LABEL${EXTRA_LABELS:+ + $EXTRA_LABELS}
 
 Workflow usage:
   runs-on: [self-hosted, $SHARED_LABEL]    # any host in the fleet
