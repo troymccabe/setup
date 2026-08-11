@@ -30,8 +30,16 @@
 #   HOST_LABEL      Per-host label (this machine)         [<hostname -s, lowercased>]
 #   EXTRA_LABELS    Comma-separated extra labels appended [""]
 #                   to every runner registration (e.g.
-#                   "mobile-runner,xcode-26.6" when the
-#                   image carries a mobile toolchain).
+#                   "mobile-runner" when the image carries
+#                   a mobile toolchain). Do NOT put
+#                   macos-major-*/xcode-*/image-* here —
+#                   those are PROBED from the booted VM and
+#                   a static one would be dropped anyway.
+#   REQUIRE_XCODE   "1" = a VM with no Xcode is a broken    [0]
+#                   image: recycle it instead of
+#                   registering a runner without an
+#                   xcode-* label. Leave 0 for fleets that
+#                   legitimately run Xcode-less images.
 #   SCOPE_REPO      "owner/repo" to gate the group to;    [""]
 #                   empty = org-wide (any repo in org may use these runners)
 #   SOURCE_IMAGE    Remote Tart image, fetched ONCE at    [ghcr.io/cirruslabs/macos-tahoe-xcode:26.5]
@@ -170,6 +178,7 @@ __main__() {
   SHARED_LABEL="${SHARED_LABEL:-macos-runner}"
   HOST_LABEL="${HOST_LABEL:-$(hostname -s | tr '[:upper:]' '[:lower:]')}"
   EXTRA_LABELS="${EXTRA_LABELS:-}"
+  REQUIRE_XCODE="${REQUIRE_XCODE:-0}"
   SCOPE_REPO="${SCOPE_REPO:-}"
   REGISTRY_USER="${REGISTRY_USER:-}"
   REGISTRY_PAT="${REGISTRY_PAT:-}"
@@ -308,6 +317,10 @@ __main__() {
       exit 1
     fi
     BASE_IMAGE="base-$(basename "${SOURCE_IMAGE%:*}")-${src_tag}"
+    # Record the tag verbatim. The orchestrator's fallback splits BASE_IMAGE on
+    # the last `-`, which truncates a hyphenated tag (26.5-rc.1 → "rc.1") and
+    # would make two builds collide under one image-* label.
+    IMAGE_TAG="$src_tag"
     if tart list --format json | jq -e --arg n "$BASE_IMAGE" \
         '.[] | select(.Source=="local" and .Name==$n)' >/dev/null; then
       step "Local base VM $BASE_IMAGE already present — skipping download"
@@ -399,12 +412,17 @@ RUNNER_GROUP="$RUNNER_GROUP"
 SHARED_LABEL="$SHARED_LABEL"
 HOST_LABEL="$HOST_LABEL"
 EXTRA_LABELS="$EXTRA_LABELS"
+REQUIRE_XCODE="$REQUIRE_XCODE"
 SCOPE_REPO="$SCOPE_REPO"
 # BASE_IMAGE is a LOCAL tart VM name — never a remote ref (see "Base image
 # model" in the setup script header). SOURCE_IMAGE records provenance only;
 # it is empty when the base VM arrived out of band.
 BASE_IMAGE="$BASE_IMAGE"
 SOURCE_IMAGE="$SOURCE_IMAGE"
+# Exact source tag when this install derived BASE_IMAGE from SOURCE_IMAGE;
+# empty for an out-of-band local VM, where the orchestrator falls back to
+# splitting BASE_IMAGE's name.
+IMAGE_TAG="${IMAGE_TAG:-}"
 VM_MEMORY_MB="$VM_MEMORY_MB"
 VM_CPU_COUNT="$VM_CPU_COUNT"
 VM_DISK_GB="$VM_DISK_GB"
@@ -701,6 +719,71 @@ while true; do
     log "ERROR: sshd never came up"; cleanup_vm "$vm_name"; sleep 30; continue
   fi
 
+  # ── Capability labels, READ OUT OF THE BOOTED VM ─────────────────────
+  # Workflows gate on these (`runs-on: [macos-major-26, xcode-26.6]`) so a job
+  # with a toolchain floor cannot land on an image that lacks it.
+  #
+  # DERIVED, never hand-maintained. A label taken from config.env or inferred
+  # from BASE_IMAGE's name asserts what SHOULD be in the image; only the VM
+  # knows what IS. An asserted label that has drifted is worse than no gate at
+  # all — it routes the job confidently to the wrong toolchain. So the probe
+  # OWNS the `macos-major-*`, `xcode-*` and `image-*` namespaces, and a static
+  # label in one of them is discarded below.
+  #
+  # ONE ssh round-trip for all probes, retried. Two back-to-back connections
+  # proved flaky in practice (the second returned empty), which silently
+  # dropped a label and left gated jobs queued until GitHub's 24h auto-cancel —
+  # a stall that reads as "no capacity" rather than "probe failed".
+  #
+  # The remote side assembles the values and prints EXACTLY two lines. Letting
+  # each probe write its own line is a trap: a command that produces no stdout
+  # (`xcodebuild` on an Xcode-less image) emits no line at all rather than an
+  # empty one, so every later value shifts up — the macOS version would be read
+  # as the Xcode version, advertising a fabricated `xcode-26`. Assembling first
+  # and printing once keeps line N meaning field N. Redirecting ~/.zprofile's
+  # stdout matters for the same reason: a profile that echoes anything would
+  # otherwise land in the parsed output.
+  vm_xcode=""; vm_macos_major=""; probe_ok=0
+  for probe_attempt in 1 2 3; do
+    probe="$(ssh_vm "$vm_ip" 'source ~/.zprofile >/dev/null 2>&1 || true; x="$(xcodebuild -version 2>/dev/null | sed -n "1s/^Xcode //p")"; m="$(sw_vers -productVersion 2>/dev/null | cut -d. -f1)"; printf "%s\n%s\n" "$x" "$m"' 2>/dev/null || true)"
+    vm_xcode="$(printf '%s\n' "$probe" | sed -n 1p | tr -d '[:space:]')"
+    vm_macos_major="$(printf '%s\n' "$probe" | sed -n 2p | tr -d '[:space:]')"
+    probe_ok=1
+    # sw_vers exists on every macOS, so a missing major version means the probe
+    # itself failed, not that the image lacks something.
+    [[ -z "$vm_macos_major" ]] && probe_ok=0
+    [[ "${REQUIRE_XCODE:-0}" == "1" && -z "$vm_xcode" ]] && probe_ok=0
+    [[ "$probe_ok" == "1" ]] && break
+    log "capability probe attempt $probe_attempt incomplete (xcode='${vm_xcode:-none}' macos='${vm_macos_major:-none}'); retrying"
+    sleep 5
+  done
+
+  # Recycle rather than register a half-labelled runner: one that is missing a
+  # capability label cannot serve gated jobs, so registering it produces a
+  # silent queue-until-cancel. A fresh VM self-heals from a transient flake.
+  if [[ "$probe_ok" != "1" ]]; then
+    log "ERROR: capability probe failed after 3 attempts in $vm_name; recycling VM"
+    cleanup_vm "$vm_name"; sleep 30; continue
+  fi
+
+  # No Xcode is a legitimate image for a non-Apple-toolchain fleet, so it is a
+  # note rather than an error — the xcode-* label is simply absent and gated
+  # jobs pass this runner by. Set REQUIRE_XCODE=1 on a fleet where a missing
+  # Xcode means a broken image and you want it to fail loudly instead.
+  if [[ -z "$vm_xcode" ]]; then
+    log "note: no Xcode found in $vm_name — registering without an xcode-* label"
+  fi
+
+  # Which image this VM was cloned from, recorded as a label so a bad build is
+  # traceable from the job page without shelling into the host. IMAGE_TAG is
+  # the exact tag captured at install time; the fallback splits BASE_IMAGE's
+  # name (e.g. `zukan-mobile-runner-2026.07.4` → `2026.07.4`) for a VM that
+  # arrived out of band, and is lossy for a hyphenated tag.
+  image_tag="${IMAGE_TAG:-${BASE_IMAGE##*[:-]}}"
+  derived_labels="macos-major-${vm_macos_major},image-${image_tag}"
+  [[ -n "$vm_xcode" ]] && derived_labels="${derived_labels},xcode-${vm_xcode}"
+  log "probed capabilities: $derived_labels"
+
   # Register the runner only now that the VM can actually take a job.
   # Minting the JIT config before boot left a runner visible-but-offline in
   # GitHub for the whole boot window (a slow cycle reads as a dead host in
@@ -718,12 +801,53 @@ while true; do
   # `labels` field passed to generate-jitconfig is the COMPLETE set,
   # so include them explicitly — otherwise workflows that ask for
   # `[self-hosted, macos-26]` won't match this runner. EXTRA_LABELS
-  # (comma-separated) advertises image capabilities (e.g.
-  # mobile-runner,xcode-26.6) so capability-gated workflows can route here.
+  # (comma-separated) advertises image capabilities (e.g. mobile-runner)
+  # so capability-gated workflows can route here.
+  #
+  # The probe above owns `macos-major-*`, `xcode-*` and `image-*`: a static
+  # SHARED_LABEL/EXTRA_LABELS entry in one of those namespaces is an assertion
+  # about the image that may have drifted, so it is dropped and the probed
+  # value used instead. Put capabilities the VM cannot report (e.g.
+  # `mobile-runner`) in EXTRA_LABELS; anything it CAN report comes from the
+  # probe, not config.env.
+  #
+  # HOST_LABEL is exempt: it is the host's IDENTITY, not a capability claim, so
+  # a mini literally named `xcode-mini` keeps its label and
+  # `runs-on: [self-hosted, xcode-mini]` still works. Label matching is exact
+  # string equality, so an identity label can never satisfy a job gated on
+  # `xcode-26.6`.
+  #
+  # A static label that AGREES with the probe is a silent no-op; one that
+  # contradicts it means config.env has drifted from the image, which is worth
+  # saying out loud once per cycle rather than discovering via a job that never
+  # gets scheduled.
+  # Matched case-INSENSITIVELY: GitHub treats runner labels that way, so a
+  # config entry of `Xcode-26.5` would otherwise slip past this filter and go
+  # on satisfying `runs-on: [xcode-26.5]` next to the probed `xcode-26.6`.
+  # `clean` trims each entry: `EXTRA_LABELS="mobile-runner, xcode-26.5"` is a
+  # natural way to write the list, and the resulting " xcode-26.5" would slip
+  # past the ^-anchored namespace regex and get registered as-is.
+  stale_labels="$(jq -nr --arg s "$SHARED_LABEL" --arg x "${EXTRA_LABELS:-}" \
+    --arg d "$derived_labels" \
+    'def clean: map(gsub("^[[:space:]]+|[[:space:]]+$"; "")) | map(select(length > 0));
+     ($d | split(",") | clean | map(ascii_downcase)) as $probed
+     | (([$s] + ($x | split(","))) | clean)
+     | map(select(test("^(macos-major|xcode|image)-"; "i")))
+     | map(select(. as $l | ($probed | index($l | ascii_downcase)) == null))
+     | join(", ")')"
+  if [[ -n "$stale_labels" ]]; then
+    log "WARNING: config label(s) contradict the image, using probed values: $stale_labels"
+  fi
+
   labels_json="$(jq -nc --arg s "$SHARED_LABEL" --arg h "$HOST_LABEL" \
-    --arg x "${EXTRA_LABELS:-}" \
-    '["self-hosted", "macOS", "arm64", $s, $h]
-     + ($x | split(",") | map(select(length > 0)))')"
+    --arg x "${EXTRA_LABELS:-}" --arg d "$derived_labels" \
+    'def clean: map(gsub("^[[:space:]]+|[[:space:]]+$"; "")) | map(select(length > 0));
+     ((([$s] + ($x | split(","))) | clean)
+      | map(select(test("^(macos-major|xcode|image)-"; "i") | not)))
+     + ["self-hosted", "macOS", "arm64", $h]
+     + ($d | split(",") | clean)
+     | clean
+     | unique')"
   jit_body="$(jq -nc \
     --arg name "$runner_name" \
     --argjson group_id "$GROUP_ID" \
@@ -873,10 +997,16 @@ Surviving reboots:
 GitHub:
   • Each job spawns a fresh runner with labels:
       self-hosted, macOS, arm64 (auto) + $SHARED_LABEL + $HOST_LABEL${EXTRA_LABELS:+ + $EXTRA_LABELS}
+      + PROBED from the booted VM: macos-major-<N>, image-<tag>, xcode-<ver>
+        (xcode-* only when the image has Xcode$([[ "$REQUIRE_XCODE" == "1" ]] && printf '%s' "; REQUIRE_XCODE=1, so a VM without it is recycled"))
 
 Workflow usage:
   runs-on: [self-hosted, $SHARED_LABEL]    # any host in the fleet
   runs-on: [self-hosted, $HOST_LABEL]      # this specific host
+  runs-on: [macos-major-26, xcode-26.6]    # capability-gated, host-agnostic
+
+  Prefer the capability form for jobs with a toolchain floor: it cannot land
+  on an image that lacks what it needs, and it does not pin work to one host.
 
 Adding another host:
   Run this script on the new machine with HOST_LABEL=<name>. Same
