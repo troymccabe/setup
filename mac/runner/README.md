@@ -39,13 +39,69 @@ tokens recommended).
 | 6 | Installs a launchd agent that runs the orchestrator loop |
 
 Each spawned runner carries the labels
-`self-hosted, macOS, arm64` + `SHARED_LABEL` + `HOST_LABEL` + any `EXTRA_LABELS`.
+`self-hosted, macOS, arm64` + `SHARED_LABEL` + `HOST_LABEL` + any `EXTRA_LABELS`,
+plus **capability labels read out of the booted VM** — `macos-major-<N>` and
+`xcode-<version>` (the latter only when Xcode is present) — and `image-<tag>`,
+derived from the `BASE_IMAGE` VM name for traceability.
 
 ```yaml
 runs-on: [self-hosted, macos-runner]   # any host in the fleet
 runs-on: [self-hosted, <hostname>]     # this specific host
-runs-on: [mobile-runner, xcode-26.6]   # capability labels via EXTRA_LABELS
+runs-on: [macos-major-26, xcode-26.6]  # capability-gated, host-agnostic
 ```
+
+Prefer the capability form for any job with a toolchain floor. It cannot land
+on an image that lacks what it needs, and it does not pin work to one host.
+
+**The omission of `self-hosted` there is deliberate — don't add it back.** It is
+the form GitHub's docs show, so it looks like a mistake, but it is a *provenance*
+label, not a capability: it says who owns the machine, which the scheduler
+already knows from the namespaced labels. Requiring it is how a fleet ends up
+with one usable runner and a multi-hour queue — a host registered through
+`generate-jitconfig` gets only the labels it is handed, and any orchestrator
+that forgets `self-hosted` becomes permanently invisible to jobs that demand it.
+That is a real outage this fleet has had. Runners should advertise a superset
+(this script always includes `self-hosted`); workflows should demand only what
+they actually need.
+
+### Capability labels are derived, never asserted
+
+The orchestrator SSHes into each freshly booted VM and reads `xcodebuild
+-version` and `sw_vers` before registering the runner. A label taken from
+`config.env` says what *should* be in the image; only the VM knows what *is*,
+and an asserted label that has drifted is worse than no gate at all — it routes
+the job confidently to the wrong toolchain.
+
+So the probe **owns** the `macos-major-*`, `xcode-*` and `image-*` namespaces. A
+static `SHARED_LABEL` / `EXTRA_LABELS` entry in one of them is dropped and the
+probed value used instead; if it *contradicts* what the VM reported, the
+orchestrator logs a warning rather than dropping it silently. Put capabilities
+the VM cannot report — like `mobile-runner` — in `EXTRA_LABELS`; anything it
+*can* report should come from the probe.
+
+`HOST_LABEL` is exempt — it is the host's identity, not a capability claim, so a
+mini named `xcode-mini` keeps its label. Label matching is exact string
+equality, so an identity label can never satisfy a job gated on `xcode-26.6`.
+
+`image-<tag>` is the one *derived* rather than probed label — it records which
+image the VM was cloned from, for tracing a bad build from the job page. It
+comes from the pinned `SOURCE_IMAGE` tag captured at install time; for a VM that
+arrived out of band it falls back to splitting the `BASE_IMAGE` name on the last
+`-`, which is lossy for a hyphenated tag. Either way it reflects the image's
+name, not its contents — only `macos-major-*` and `xcode-*` are read from the
+running VM.
+
+Fail-safe by construction:
+
+- The probe retries **3×** in a single SSH round-trip each time. Two
+  back-to-back connections proved flaky (the second returned empty), which
+  silently dropped a label and left gated jobs queued until GitHub's 24h
+  auto-cancel — a stall that reads as "no capacity" rather than "probe failed".
+- If macOS version can't be read at all, the VM is **recycled** rather than
+  registered half-labelled.
+- No Xcode is a legitimate image, so the `xcode-*` label is simply absent and
+  gated jobs pass the runner by. Set **`REQUIRE_XCODE=1`** on a fleet where a
+  missing Xcode means a broken image and you want it recycled loudly instead.
 
 ---
 
@@ -244,7 +300,8 @@ Set via environment variables at run time (defaults shown):
 | `RUNNER_GROUP` | `macos-runners` | Org-level runner group |
 | `SHARED_LABEL` | `macos-runner` | Fleet label all runners carry |
 | `HOST_LABEL` | `<hostname -s>` | Per-host label |
-| `EXTRA_LABELS` | `""` | Comma-separated capability labels appended to every registration (e.g. `mobile-runner,xcode-26.6`) |
+| `EXTRA_LABELS` | `""` | Comma-separated capability labels appended to every registration (e.g. `mobile-runner`). `macos-major-*`/`xcode-*`/`image-*` are **probed** — a static one here is dropped |
+| `REQUIRE_XCODE` | `0` | `1` = a VM with no Xcode is a broken image: recycle it instead of registering without an `xcode-*` label |
 | `SCOPE_REPO` | `""` | `owner/repo` to gate the group to (empty = org-wide) |
 | `SOURCE_IMAGE` | `ghcr.io/cirruslabs/macos-tahoe-xcode:26.5` | Remote image, fetched once. Pinned tag required — `:latest` refused |
 | `BASE_IMAGE` | *derived*: `base-<image>-<tag>` | Existing **local** Tart VM to use instead of pulling `SOURCE_IMAGE` |
