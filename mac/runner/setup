@@ -19,6 +19,10 @@
 #   GH_ORG          GitHub organization (e.g. "MyOrg")
 #   GH_PAT          PAT with "Self-hosted runners (Admin)" permission on the org
 #                   Fine-grained tokens are recommended.
+#                   With OP_ITEM_REF set this is an INSTALL-TIME-ONLY value: it
+#                   creates/scopes the runner group and is then discarded, never
+#                   written to disk. Without it, the PAT is persisted in
+#                   config.env for the orchestrator to reuse (see "Credentials").
 #
 # OPTIONAL env vars (defaults shown):
 #   RUNNER_GROUP    Org-level runner group name           [macos-runners]
@@ -52,6 +56,15 @@
 #                   one (~/actions-runner present → this
 #                   is never used). Bump when GitHub
 #                   deprecates the pinned release.
+#   OP_ITEM_REF     1Password secret reference for the    [""]
+#                   registration PAT, e.g.
+#                   op://vault/runner-jit-pat/credential
+#                   Set it to opt into the op-read model
+#                   (see "Credentials" below). Unset =
+#                   today's behaviour, unchanged.
+#   OP_TOKEN_FILE   Where the 1Password service-account   [~/.config/gha-runner/op-token]
+#                   token is stored (0600). Only used
+#                   when OP_ITEM_REF is set.
 #   VM_MEMORY_MB    Per-VM memory                         [10240]
 #   VM_CPU_COUNT    Per-VM CPUs                           [4]
 #   VM_DISK_GB      Per-VM disk (GB); empty = keep the    [""]
@@ -67,6 +80,32 @@
 #                   64 GB host fits 5+ concurrent VMs.
 #   LAUNCHD_LABEL   launchd job label                     [dev.<lowercased-GH_ORG>.gha-runner]
 #   CONFIG_DIR      Where to stash config + scripts       [~/.gha-runner]
+#
+# Credentials — two models, chosen per host at install time:
+#
+#   DEFAULT (OP_ITEM_REF unset). GH_PAT is written to config.env (0600) and the
+#   orchestrator sources it. Simple, no extra dependency. The PAT sits on disk
+#   indefinitely, so rotating it means editing config.env on every host.
+#
+#   OP-READ (OP_ITEM_REF set). The PAT is NEVER persisted. The orchestrator
+#   fetches it from 1Password at the top of every cycle using a service-account
+#   token — the only secret at rest. Rotating the PAT is a vault edit that takes
+#   effect on the next cycle, with zero host visits.
+#
+# What op-read does and does not buy you, stated plainly: it protects the PAT
+# from every leak channel that is not host access — logs, screenshots, backups,
+# a stray file read. It does NOT protect against host compromise, because an
+# attacker holding the service-account token can op-read the PAT themselves.
+# Pair it with "a compromised host is rebuilt, not re-credentialed" — cheap
+# here, since this script reprovisions a host from scratch and every job already
+# runs in a throwaway VM.
+#
+# There is deliberately NO runtime fallback. If op-read is on and 1Password is
+# unreachable, the agent backs off and retries; it does not fall back to a
+# persisted PAT, because a fallback PAT on disk would defeat the entire point.
+# In-flight jobs are unaffected (the PAT is fetched before a VM is cloned); new
+# cycles stall until 1Password returns. GH_PAT survives as an env override for
+# local debugging only — never put it in the plist.
 #
 # Base image model:
 #   The remote image is materialised ONCE as a local Tart VM
@@ -135,6 +174,14 @@ __main__() {
   REGISTRY_USER="${REGISTRY_USER:-}"
   REGISTRY_PAT="${REGISTRY_PAT:-}"
   RUNNER_VERSION="${RUNNER_VERSION:-2.335.1}"
+  OP_ITEM_REF="${OP_ITEM_REF:-}"
+  OP_TOKEN_FILE="${OP_TOKEN_FILE:-$HOME/.config/gha-runner/op-token}"
+
+  if [[ -n "$OP_ITEM_REF" && "$OP_ITEM_REF" != op://* ]]; then
+    echo "ERROR: OP_ITEM_REF must be a 1Password secret reference (got: $OP_ITEM_REF)" >&2
+    echo "       e.g. op://vault-name/runner-jit-pat/credential" >&2
+    exit 1
+  fi
   SOURCE_IMAGE="${SOURCE_IMAGE:-ghcr.io/cirruslabs/macos-tahoe-xcode:26.5}"
   BASE_IMAGE="${BASE_IMAGE:-}"
   VM_MEMORY_MB="${VM_MEMORY_MB:-10240}"
@@ -187,6 +234,45 @@ __main__() {
   if ! command -v tart >/dev/null; then
     echo "ERROR: tart didn't install — see brew output above" >&2
     exit 1
+  fi
+
+  # -----------------------------------------------------------------------
+  # 1Password CLI + service-account token (op-read model only)
+  # -----------------------------------------------------------------------
+  if [[ -n "$OP_ITEM_REF" ]]; then
+    step "Installing 1password-cli (OP_ITEM_REF is set)"
+    if ! command -v op >/dev/null; then
+      brew install --quiet 1password-cli 2>&1 | grep -E "^(==>|Warning|Error)" || true
+    fi
+    command -v op >/dev/null || { echo "ERROR: 1password-cli didn't install" >&2; exit 1; }
+
+    if [[ ! -s "$OP_TOKEN_FILE" ]]; then
+      step "1Password service-account token"
+      echo "  Paste the service-account token (read-only on the vault holding"
+      echo "  $OP_ITEM_REF). Input is hidden; it is written 0600 and is the only"
+      echo "  secret that will live on this host."
+      local _op_token
+      read -r -s -p "  token: " _op_token < /dev/tty; echo
+      [[ -n "$_op_token" ]] || { echo "ERROR: empty token" >&2; exit 1; }
+      mkdir -p "$(dirname "$OP_TOKEN_FILE")"
+      ( umask 077; printf '%s\n' "$_op_token" > "$OP_TOKEN_FILE" )
+      unset _op_token
+    else
+      echo "  token file already present at $OP_TOKEN_FILE — leaving it alone"
+    fi
+    chmod 600 "$OP_TOKEN_FILE"
+
+    # Fail here, not silently at 3am on the first job cycle.
+    step "Verifying op can read $OP_ITEM_REF"
+    if ! OP_SERVICE_ACCOUNT_TOKEN="$(cat "$OP_TOKEN_FILE")" \
+         op read "$OP_ITEM_REF" >/dev/null 2>&1; then
+      echo "ERROR: op could not read $OP_ITEM_REF with the stored token." >&2
+      echo "       Check the reference, the token, and that the service account" >&2
+      echo "       has read access to that vault. Token left at $OP_TOKEN_FILE;" >&2
+      echo "       delete it to be re-prompted." >&2
+      exit 1
+    fi
+    echo "  op read OK — the PAT will be fetched per cycle and never persisted"
   fi
 
   # -----------------------------------------------------------------------
@@ -300,7 +386,15 @@ __main__() {
   cat > "$CONFIG_FILE" <<EOF
 # Auto-generated by mac-runner-setup.sh. Re-running setup overwrites this.
 GH_ORG="$GH_ORG"
-GH_PAT="$GH_PAT"
+# GH_PAT is written ONLY in the default model. With OP_ITEM_REF set the PAT is
+# never persisted — the orchestrator op-reads it per cycle (see "Credentials"
+# in the setup script header).
+$(if [[ -n "$OP_ITEM_REF" ]]; then
+    printf 'OP_ITEM_REF="%s"\n' "$OP_ITEM_REF"
+    printf 'OP_TOKEN_FILE="%s"' "$OP_TOKEN_FILE"
+  else
+    printf 'GH_PAT="%s"' "$GH_PAT"
+  fi)
 RUNNER_GROUP="$RUNNER_GROUP"
 SHARED_LABEL="$SHARED_LABEL"
 HOST_LABEL="$HOST_LABEL"
@@ -342,9 +436,77 @@ CURRENT_RUNNER_ID=""
 
 log() { printf '[%s] %s\n' "$(date +%H:%M:%S)" "$*"; }
 
+# --- registration credential -------------------------------------------
+# Two models (chosen at install time; see the setup header's "Credentials"):
+#   OP_ITEM_REF set  → fetch from 1Password at the top of EVERY cycle. The PAT
+#                      is never persisted, so rotating it is a vault edit that
+#                      lands on the next cycle with no host visit.
+#   OP_ITEM_REF unset→ GH_PAT was sourced from config.env above.
+#
+# No fallback by design: with op-read on, a PAT cached on disk would defeat the
+# whole point. If 1Password is unreachable the cycle backs off and retries —
+# in-flight jobs are untouched because this runs BEFORE the VM is cloned.
+# A GH_PAT in the environment overrides op-read for local debugging only; never
+# put it in the plist.
+# Sets GH_PAT_CURRENT; returns non-zero on failure. Deliberately NOT a
+# stdout-returning function: log() writes to stdout, so a `$(resolve_gh_pat)`
+# capture would swallow every diagnostic AND concatenate the log line onto the
+# token on the override path. Setting a variable keeps diagnostics in
+# orchestrator.log where triage expects them.
+resolve_gh_pat() {
+  GH_PAT_CURRENT=""
+  if [[ -z "${OP_ITEM_REF:-}" ]]; then
+    GH_PAT_CURRENT="${GH_PAT:-}"
+    return 0
+  fi
+  if [[ -n "${GH_PAT:-}" ]]; then
+    log "using GH_PAT env override (local debug only — not for plists)"
+    GH_PAT_CURRENT="$GH_PAT"
+    return 0
+  fi
+  local token_file="${OP_TOKEN_FILE:-$HOME/.config/gha-runner/op-token}"
+  if [[ ! -r "$token_file" ]]; then
+    log "ERROR: op token file missing/unreadable: $token_file — re-run setup"
+    return 1
+  fi
+  local out err_file op_rc
+  err_file="$(mktemp)"
+  out="$(OP_SERVICE_ACCOUNT_TOKEN="$(cat "$token_file")" \
+         op read "$OP_ITEM_REF" 2>"$err_file")"
+  op_rc=$?
+  if [[ $op_rc -eq 0 && -n "${out//[[:space:]]/}" ]]; then
+    rm -f "$err_file"
+    GH_PAT_CURRENT="$out"
+    return 0
+  fi
+  local err; err="$(cat "$err_file")"; rm -f "$err_file"
+
+  # Distinguishable classes — triage should be "which of these four", not a log
+  # dive. Never echo op's raw output; it can carry vault metadata into a log
+  # that outlives the incident.
+  #
+  # A zero exit with empty output is its OWN class: the item resolved but the
+  # field is blank. Reporting that as "unreachable" would send whoever is
+  # holding the pager at 3am to check 1Password's status page instead of the
+  # one field that is actually wrong.
+  if [[ $op_rc -eq 0 ]]; then
+    log "ERROR: op read returned an EMPTY credential for $OP_ITEM_REF — the item resolved but its field is blank"
+    return 1
+  fi
+  case "$err" in
+    *401*|*Unauthorized*|*"invalid service account token"*)
+      log "ERROR: op read failed — bad service-account token (rotate it, re-run setup)" ;;
+    *"isn't an item"*|*"not found"*|*"no vault"*)
+      log "ERROR: op read failed — missing item ($OP_ITEM_REF); check the vault" ;;
+    *)
+      log "ERROR: op unreachable — 1Password down or no network; retrying next cycle" ;;
+  esac
+  return 1
+}
+
 gh_api() {
   curl -fsS \
-    -H "Authorization: Bearer $GH_PAT" \
+    -H "Authorization: Bearer $GH_PAT_CURRENT" \
     -H "Accept: application/vnd.github+json" \
     -H "X-GitHub-Api-Version: 2022-11-28" \
     "$@"
@@ -457,12 +619,37 @@ reap_orphans() {
       done
 }
 reap_orphans
-reap_pending_runners
+# Startup reaping calls the GitHub API, so it needs a credential too. Best
+# effort: if it can't be resolved (1Password down at boot), skip the reap
+# rather than refuse to start — the ledger persists and the next successful
+# startup clears it.
+startup_reap_pending=1
+if resolve_gh_pat; then
+  reap_pending_runners
+  startup_reap_pending=0
+else
+  log "deferring startup reap — no credential yet; will run on first good cycle"
+fi
 # Per-VM console logs: the happy path deletes its own; failures keep theirs
 # for post-mortems. Don't let those accumulate forever.
 find "$CONFIG_DIR" -name 'vm-ephem-*.log' -mtime +7 -delete 2>/dev/null || true
 
 while true; do
+  # Fetch the credential FIRST, before any VM exists, so a credential failure
+  # can never orphan or kill a VM. With op-read this is the per-cycle fetch
+  # that makes vault-edit rotation land without touching the host.
+  if ! resolve_gh_pat; then
+    sleep 60
+    continue
+  fi
+  # If the startup reap was skipped (1Password down at boot), do it on the
+  # first cycle that has a credential — otherwise runners stranded by the
+  # previous crash linger in GitHub until someone restarts the agent.
+  if [[ "$startup_reap_pending" == "1" ]]; then
+    log "running deferred startup reap"
+    reap_pending_runners
+    startup_reap_pending=0
+  fi
   release_current_runner
   vm_name="ephem-$(uuidgen | tr 'A-Z' 'a-z' | cut -c1-8)"
   runner_name="$HOST_LABEL-$(date +%s)"

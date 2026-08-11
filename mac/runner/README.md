@@ -32,7 +32,7 @@ tokens recommended).
 | Step | Description |
 |------|-------------|
 | 1 | Sanity checks (Apple Silicon, Homebrew) |
-| 2 | Installs `tart` + `softnet` + `jq` + `sshpass` |
+| 2 | Installs `tart` + `softnet` + `jq` + `sshpass` (+ `1password-cli` if `OP_ITEM_REF` is set) |
 | 3 | Materialises the base image as a **local Tart VM** (one-time download; see below) |
 | 4 | Ensures the org runner group exists, optionally scopes it to one repo |
 | 5 | Writes config + orchestrator script to `~/.gha-runner` |
@@ -46,6 +46,79 @@ runs-on: [self-hosted, macos-runner]   # any host in the fleet
 runs-on: [self-hosted, <hostname>]     # this specific host
 runs-on: [mobile-runner, xcode-26.6]   # capability labels via EXTRA_LABELS
 ```
+
+---
+
+## Credentials
+
+Two models, chosen per host at install time.
+
+### Default — PAT in `config.env`
+
+`OP_ITEM_REF` unset. `GH_PAT` is written to `config.env` (0600) and the
+orchestrator sources it. No extra dependency; nothing else to run.
+
+The PAT sits on disk indefinitely, so rotating it means editing `config.env` on
+every host. Fine for one machine or a throwaway setup.
+
+### op-read — PAT never touches disk
+
+Set `OP_ITEM_REF` to a 1Password secret reference:
+
+```sh
+GH_ORG=YourOrg GH_PAT=ghp_xxxxx \
+OP_ITEM_REF='op://runners/runner-jit-pat/credential' \
+    mac/runner/setup
+```
+
+The installer adds `1password-cli`, prompts once for a **service-account token**
+(hidden input, written 0600), and verifies it can actually read the reference
+before finishing — so a bad vault path fails now, not silently at 3am on the
+first job cycle.
+
+After that the orchestrator fetches the PAT from 1Password **at the top of every
+cycle**. `GH_PAT` is used for install-time setup only and is never persisted:
+`config.env` records `OP_ITEM_REF` and `OP_TOKEN_FILE`, nothing secret.
+
+**Rotating the PAT** becomes a vault edit — replace the credential, revoke the
+old token on GitHub. Every host picks it up on its next cycle with **no host
+visits**.
+
+### What op-read does and doesn't buy you
+
+It protects the PAT from every leak channel that **isn't** host access: logs,
+screenshots, backups, a stray file read, a `config.env` copied somewhere it
+shouldn't be.
+
+It does **not** protect against host compromise — an attacker holding the
+service-account token can `op read` the PAT themselves. Pair it with *a
+compromised host is rebuilt, not re-credentialed*, which is cheap here: this
+script reprovisions a host from scratch, every job already runs in a throwaway
+VM, and the rebuild issues a fresh service-account token as a side effect.
+
+Scope the service account **read-only to a vault holding nothing but runner
+credentials** — that vault's contents are the token's entire blast radius.
+
+### No runtime fallback, on purpose
+
+If 1Password is unreachable the agent backs off 60s and retries. It does **not**
+fall back to a cached PAT, because a PAT cached on disk would defeat the whole
+point of the model.
+
+In-flight jobs are unaffected — the credential is fetched *before* a VM is
+cloned — but new cycles stall until 1Password returns. The failure classes are
+logged distinguishably, so triage is one line rather than a log dive:
+
+| Log line | Means |
+|---|---|
+| `op unreachable` | 1Password down or no network — retrying |
+| `bad service-account token` | Token revoked/expired — rotate it, re-run setup |
+| `missing item` | Wrong `OP_ITEM_REF`, or the vault lost the item |
+| `EMPTY credential` | Item resolved but its field is blank — a config error, not an outage |
+
+`GH_PAT` in the environment overrides op-read for local debugging. **Never put
+it in the plist** — that re-creates the persistent-plaintext-PAT problem this
+model exists to remove, in a file nobody thinks to audit.
 
 ---
 
@@ -165,7 +238,9 @@ Set via environment variables at run time (defaults shown):
 | Var | Default | Purpose |
 |-----|---------|---------|
 | `GH_ORG` | *(required)* | GitHub organization |
-| `GH_PAT` | *(required)* | PAT with Self-hosted runners (Admin) |
+| `GH_PAT` | *(required)* | PAT with Self-hosted runners (Admin). With `OP_ITEM_REF` set this is **install-time only** and is never written to disk |
+| `OP_ITEM_REF` | `""` | 1Password secret reference (`op://vault/item/field`). Set it to opt into the op-read model — see [Credentials](#credentials) |
+| `OP_TOKEN_FILE` | `~/.config/gha-runner/op-token` | Where the 1Password service-account token is stored (0600). Only used with `OP_ITEM_REF` |
 | `RUNNER_GROUP` | `macos-runners` | Org-level runner group |
 | `SHARED_LABEL` | `macos-runner` | Fleet label all runners carry |
 | `HOST_LABEL` | `<hostname -s>` | Per-host label |
@@ -239,6 +314,7 @@ Idempotent — safe to run again at any time:
 
 - The runner group + repo scoping are no-op on the second pass
 - An already-materialised base VM is detected and the download skipped
+- An existing 1Password service-account token is left alone (delete it to be re-prompted)
 - The orchestrator + plist are overwritten with identical content
 - The launchd service is cycled
 - In-flight VMs from a prior run are reaped on the next orchestrator start
