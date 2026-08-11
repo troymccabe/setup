@@ -76,6 +76,86 @@ Consequences:
   per-job runner download entirely; otherwise the pinned `RUNNER_VERSION` is
   installed.
 
+### `du` lies about clones — use `diskutil`
+
+Tart clones are APFS copy-on-write, and `du` counts shared blocks against
+**every** file that references them. A per-job clone will read as ~50 GB when
+its true cost is a few GB:
+
+```
+du -sh ~/.tart/vms/*          →  base 50G, clone 49G   ("99 GB used!")
+delete the clone              →  container free space +2.68 GB
+```
+
+So don't size a host from `du`, and don't delete a clone expecting to reclaim
+its apparent size. The honest number:
+
+```sh
+diskutil info / | grep "Container Free Space"
+```
+
+A full job cycle costs ~3 GB of real disk, reclaimed at teardown. The base
+image is the only large persistent cost.
+
+---
+
+## Building a custom base image (Tart + Packer)
+
+Not needed for a stock image — this is for hosts running a purpose-built one.
+Two traps, both of which cost hours before they were understood.
+
+### `packer build` must run in the logged-in GUI (Aqua) session
+
+Launched over a plain SSH connection, `packer build` **hangs at
+`Waiting for SSH` until it times out**. It is the same constraint as the
+runner agent (Tart drives `Virtualization.framework`, which needs a logged-in
+GUI session) — but it is easy to miss, because a build reads like an ordinary
+CLI step you'd run anywhere.
+
+Sitting at the machine (or via Screen Sharing) it just works. To drive a build
+**remotely**, run it as a one-shot LaunchAgent, which executes inside the Aqua
+session:
+
+```xml
+<!-- ~/Library/LaunchAgents/dev.local.packerbuild.plist
+     RunAtLoad=true, KeepAlive=false, ProgramArguments = /bin/bash <build script>,
+     StandardOutPath = somewhere you can tail -->
+```
+
+```sh
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/dev.local.packerbuild.plist
+tail -f <StandardOutPath>
+```
+
+`launchctl asuser $(id -u) …` is the obvious alternative and **does not work
+unprivileged** — it needs root (`Could not switch to audit session …:
+Operation not permitted`), so on a host without passwordless sudo the
+LaunchAgent is the practical route.
+
+### `no route to host` is not a failure — don't kill the run
+
+While the guest boots, the packer log emits:
+
+```
+[DEBUG] TCP connection to SSH ip/port failed: dial tcp 192.168.64.x:22: connect: no route to host
+```
+
+repeatedly. The plugin re-resolves the IP and recovers on its own —
+`handshake complete!` follows within a minute or so. **Three otherwise-healthy
+builds were abandoned mid-flight** on the assumption that this message meant
+the plugin couldn't reach its own VM.
+
+### Sizing
+
+`packer-plugin-tart` ships **darwin/arm64 only** (Tart is Apple-Silicon
+exclusive), so `packer init` fails outright on Linux — a `packer validate` CI
+job has to run on macOS.
+
+Templates commonly default to a 16 GB VM, which is unbuildable on a 16 GB
+host — the VM starves the host. Override per build, e.g.
+`PKR_VAR_vm_memory_gb=10 PKR_VAR_vm_cpu_count=6`. Budget ~110 GB free disk for
+a full Xcode image, and read free space with `diskutil`, not `du` (above).
+
 ---
 
 ## Configuration
