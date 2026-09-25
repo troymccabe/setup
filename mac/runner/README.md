@@ -202,8 +202,53 @@ Consequences:
   (or a new `BASE_IMAGE`). The old base VM is left in place; delete it after
   the first green cycle: `tart delete <old-base>`.
 - Images that bake `~/actions-runner` (e.g. purpose-built CI images) skip the
-  per-job runner download entirely; otherwise the pinned `RUNNER_VERSION` is
-  installed.
+  per-job runner download **only while the baked version matches
+  `RUNNER_VERSION`**. When it doesn't, the orchestrator replaces it in the VM
+  before starting the runner — see [A baked runner
+  ages](#a-baked-runner-ages-runner_version-is-authoritative).
+
+### A baked runner ages — `RUNNER_VERSION` is authoritative
+
+GitHub retires old `actions/runner` releases. A retired one is refused at the
+broker **after** JIT registration has already succeeded:
+
+```
+√ Connected to GitHub
+Current runner version: '2.335.1'
+2026-09-25 00:57:43Z: Listening for Jobs
+Runner listener exit with terminated error, stop the service, no retry needed.
+```
+
+with the real cause landing in `orchestrator.err`, not `orchestrator.log`:
+
+```
+An error occurred: Runner version v2.335.1 is deprecated and cannot receive messages.
+```
+
+Read from the GitHub UI this looks like a host problem — the runner appears,
+then goes offline seconds later. It also **hot-loops**: the runner exits `0`,
+so the orchestrator's non-zero backoff never fires and the host re-registers a
+doomed runner every ~25 s.
+
+`RUNNER_VERSION` is therefore the authority, not a fallback for images with no
+runner: a baked runner that disagrees with it is replaced inside the ephemeral
+VM before `run.sh` starts. Fixing a deprecation is a config bump plus an agent
+restart — no image rebuild:
+
+```sh
+# on the runner host
+sed -i '' 's/^RUNNER_VERSION=.*/RUNNER_VERSION="2.337.0"/' ~/.gha-runner/config.env
+launchctl unload ~/Library/LaunchAgents/<label>.plist
+launchctl load   ~/Library/LaunchAgents/<label>.plist
+```
+
+This cost two separate diagnoses before it was fixed (`v2.334.0`, then
+`v2.335.1`), because `RUNNER_VERSION` *looked* like the knob for it and was
+silently inert on any image that baked a runner.
+
+**The replacement costs a ~60 MB download per job VM.** To get that back, bake
+the current runner into the image and keep `RUNNER_VERSION` matching it — then
+the check is a no-op and nothing is downloaded.
 
 ### `du` lies about clones — use `diskutil`
 
@@ -306,7 +351,7 @@ Set via environment variables at run time (defaults shown):
 | `SOURCE_IMAGE` | `ghcr.io/cirruslabs/macos-tahoe-xcode:26.5` | Remote image, fetched once. Pinned tag required — `:latest` refused |
 | `BASE_IMAGE` | *derived*: `base-<image>-<tag>` | Existing **local** Tart VM to use instead of pulling `SOURCE_IMAGE` |
 | `REGISTRY_USER` / `REGISTRY_PAT` | `""` | `tart login` credentials for a private `SOURCE_IMAGE` registry |
-| `RUNNER_VERSION` | `2.335.1` | actions/runner installed in VMs whose image doesn't bake one |
+| `RUNNER_VERSION` | `2.337.0` | actions/runner version every VM runs. **Authoritative** — a runner baked into the image is replaced when it disagrees. Bump when GitHub deprecates a release |
 | `VM_MEMORY_MB` / `VM_CPU_COUNT` | `10240` / `4` | Per-VM sizing |
 | `VM_DISK_GB` | `""` (keep image's disk) | Applied only when it would **grow** the disk — Tart cannot shrink one |
 | `HOST_RESERVE_MB` | `6144` | RAM kept free for the host; gates concurrency |

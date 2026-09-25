@@ -59,11 +59,15 @@
 #                   registry (e.g. a GHCR PAT with
 #                   read:packages). Both set → login runs
 #                   before the pull; otherwise skipped.
-#   RUNNER_VERSION  actions/runner version installed      [2.335.1]
-#                   inside VMs whose image doesn't bake
-#                   one (~/actions-runner present → this
-#                   is never used). Bump when GitHub
-#                   deprecates the pinned release.
+#   RUNNER_VERSION  actions/runner version every VM runs  [2.337.0]
+#                   AUTHORITATIVE, not a fallback: a
+#                   runner baked into the image is
+#                   REPLACED when it disagrees. Bump when
+#                   GitHub deprecates the pinned release
+#                   — a deprecated runner registers fine
+#                   and is then refused at the broker, so
+#                   it shows up as a runner that goes
+#                   offline seconds after appearing.
 #   OP_ITEM_REF     1Password secret reference for the    [""]
 #                   registration PAT, e.g.
 #                   op://vault/runner-jit-pat/credential
@@ -182,7 +186,7 @@ __main__() {
   SCOPE_REPO="${SCOPE_REPO:-}"
   REGISTRY_USER="${REGISTRY_USER:-}"
   REGISTRY_PAT="${REGISTRY_PAT:-}"
-  RUNNER_VERSION="${RUNNER_VERSION:-2.335.1}"
+  RUNNER_VERSION="${RUNNER_VERSION:-2.337.0}"
   OP_ITEM_REF="${OP_ITEM_REF:-}"
   OP_TOKEN_FILE="${OP_TOKEN_FILE:-$HOME/.config/gha-runner/op-token}"
 
@@ -884,20 +888,59 @@ cd "$HOME"
 # shellcheck disable=SC1090
 source ~/.zprofile 2>/dev/null || true
 
-# Images that bake ~/actions-runner (e.g. Packer-built CI images) skip this
-# entirely. The fallback installs the PINNED version — resolving "latest"
-# via an unauthenticated API call per job is rate-limitable and lets the
-# runner drift under the fleet.
-if [[ ! -x ~/actions-runner/run.sh ]]; then
+# Images that bake ~/actions-runner (e.g. Packer-built CI images) ship a
+# runner that AGES. GitHub retires old runner versions and refuses them at
+# the broker — "Runner version vX.Y.Z is deprecated and cannot receive
+# messages" — AFTER the JIT registration has already succeeded. The failure
+# therefore presents as a runner that appears in GitHub and goes offline a
+# few seconds later, which reads as a boot/network problem rather than a
+# version one, and it hot-loops: the runner exits 0, so the orchestrator's
+# non-zero backoff never fires.
+#
+# So RUNNER_VERSION is the AUTHORITY, not just a fallback for images with no
+# runner. A baked runner that disagrees with it is replaced. Before this,
+# RUNNER_VERSION was silently inert on any image that baked a runner — a knob
+# that looked like the fix for exactly this failure and did nothing, which
+# cost a real diagnosis twice (v2.334.0, then v2.335.1).
+#
+# The pin stays a pin: the version is never resolved as "latest" from the
+# API, which is rate-limitable and would let the fleet drift mid-flight.
+runner_installed_version() {
+  [[ -x ~/actions-runner/config.sh ]] || return 1
+  (cd ~/actions-runner && ./config.sh --version 2>/dev/null | tr -d '[:space:]')
+}
+
+install_runner() {
+  local want="$1" tmp
+  tmp="$(mktemp -d)"
+  local url="https://github.com/actions/runner/releases/download/v$want/actions-runner-osx-arm64-$want.tar.gz"
+  if ! curl -fsSL -o "$tmp/runner.tar.gz" "$url"; then
+    echo "ERROR: could not download actions/runner v$want from $url" >&2
+    rm -rf "$tmp"; return 1
+  fi
+  # Replace wholesale rather than untar over the top: a partial overlay of a
+  # different version leaves mismatched assemblies in bin/ and fails at run
+  # time with an error that points nowhere near the cause. The VM is
+  # ephemeral, so discarding the baked directory costs nothing.
+  rm -rf ~/actions-runner
+  mkdir -p ~/actions-runner
+  tar xzf "$tmp/runner.tar.gz" -C ~/actions-runner
+  rm -rf "$tmp"
+}
+
+have_version="$(runner_installed_version || true)"
+if [[ -z "$have_version" ]]; then
   if [[ -z "$RUNNER_VERSION" ]]; then
     echo "ERROR: image bakes no runner and RUNNER_VERSION is unset" >&2
     exit 1
   fi
-  mkdir -p ~/actions-runner && cd ~/actions-runner
-  url="https://github.com/actions/runner/releases/download/v$RUNNER_VERSION/actions-runner-osx-arm64-$RUNNER_VERSION.tar.gz"
-  curl -fsSL -o runner.tar.gz "$url"
-  tar xzf runner.tar.gz
-  rm runner.tar.gz
+  echo "no runner in image — installing pinned v$RUNNER_VERSION"
+  install_runner "$RUNNER_VERSION"
+elif [[ -n "$RUNNER_VERSION" && "$have_version" != "$RUNNER_VERSION" ]]; then
+  echo "baked runner v$have_version != pinned v$RUNNER_VERSION — replacing"
+  install_runner "$RUNNER_VERSION"
+else
+  echo "using baked runner v$have_version"
 fi
 
 cd ~/actions-runner
