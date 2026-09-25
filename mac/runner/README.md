@@ -365,6 +365,7 @@ Set via environment variables at run time (defaults shown):
 | `VM_MEMORY_MB` / `VM_CPU_COUNT` | `10240` / `4` | Per-VM sizing |
 | `VM_DISK_GB` | `""` (keep image's disk) | Applied only when it would **grow** the disk — Tart cannot shrink one |
 | `HOST_RESERVE_MB` | `6144` | RAM kept free for the host; gates concurrency |
+| `VM_PREFIX` | `ephem-` | Name prefix for this install's ephemeral VMs. Each install **reaps every VM carrying its prefix** at startup, so two installs on one host need non-overlapping prefixes — see [Two installs on one host](#two-installs-on-one-host) |
 | `LAUNCHD_LABEL` | `dev.<org>.gha-runner` | launchd job label |
 | `CONFIG_DIR` | `~/.gha-runner` | Config + scripts location |
 
@@ -374,6 +375,32 @@ to `VM_MEMORY_MB=12288 HOST_RESERVE_MB=4096 VM_CPU_COUNT=6` — and trial the
 heaviest job once before advertising its capability label via `EXTRA_LABELS`.
 
 ---
+
+## Two installs on one host
+
+Each install is a self-contained orchestrator loop, so a host can run more than
+one — that is how `SLOTS`-style concurrency works. Three things must differ:
+
+```sh
+LAUNCHD_LABEL=dev.myorg.gha-runner-s1 CONFIG_DIR=~/.gha-runner/s1 VM_PREFIX=ephem-s1- ...
+LAUNCHD_LABEL=dev.myorg.gha-runner-s2 CONFIG_DIR=~/.gha-runner/s2 VM_PREFIX=ephem-s2- ...
+```
+
+`VM_PREFIX` is the one that is not merely tidiness. Every orchestrator reaps
+the VMs carrying its prefix **at startup** — which happens on a KeepAlive
+restart after a crash, and at every login, not just on install. An install that
+reaps a VM it did not create destroys a CI job mid-run, and the job's only
+symptom is a runner that vanished.
+
+Prefixes must not **overlap**, not merely differ: matching is `startswith`, so
+the default `ephem-` also matches `ephem-s1-…`. Pairing a default install with
+`ephem-s1-` is the same bug as sharing a prefix. The installer refuses to
+proceed when it finds an overlapping prefix on the host — it discovers the
+other installs through their plists, which record their `CONFIG_DIR`.
+
+Concurrency is still gated by RAM: each loop waits for
+`VM_MEMORY_MB + HOST_RESERVE_MB` to be free, so a 16 GB host serialises two
+installs naturally while a 64 GB host runs them side by side.
 
 ## Surviving reboots
 

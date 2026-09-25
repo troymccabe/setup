@@ -90,6 +90,16 @@
 #                   before booting. Auto-scales to host
 #                   capacity: 16 GB host serialises,
 #                   64 GB host fits 5+ concurrent VMs.
+#   VM_PREFIX       Name prefix for this install's         [ephem-]
+#                   ephemeral VMs. The orchestrator REAPS
+#                   every VM carrying its prefix at
+#                   startup, so two installs sharing one
+#                   host MUST use different prefixes or
+#                   each will destroy the other's running
+#                   job. Give every extra install on a
+#                   host its own (e.g. ephem-s1-,
+#                   ephem-s2-) alongside its own
+#                   LAUNCHD_LABEL and CONFIG_DIR.
 #   LAUNCHD_LABEL   launchd job label                     [dev.<lowercased-GH_ORG>.gha-runner]
 #   CONFIG_DIR      Where to stash config + scripts       [~/.gha-runner]
 #
@@ -201,12 +211,49 @@ __main__() {
   VM_CPU_COUNT="${VM_CPU_COUNT:-4}"
   VM_DISK_GB="${VM_DISK_GB:-}"
   HOST_RESERVE_MB="${HOST_RESERVE_MB:-6144}"
+  VM_PREFIX="${VM_PREFIX:-ephem-}"
+  # The prefix is spliced into VM names and matched with startswith() when
+  # reaping, so anything outside this set either cannot name a VM or would
+  # widen the reap beyond this install.
+  if [[ ! "$VM_PREFIX" =~ ^[a-z0-9][a-z0-9-]*-$ ]]; then
+    echo "ERROR: VM_PREFIX must be lowercase alphanumeric/dashes ending in '-' (got: $VM_PREFIX)" >&2
+    exit 1
+  fi
   LAUNCHD_LABEL="${LAUNCHD_LABEL:-dev.$ORG_LOWER.gha-runner}"
   CONFIG_DIR="${CONFIG_DIR:-$HOME/.gha-runner}"
 
   local CONFIG_FILE="$CONFIG_DIR/config.env"
   local ORCH_SCRIPT="$CONFIG_DIR/orchestrator.sh"
   local PLIST_PATH="$HOME/Library/LaunchAgents/$LAUNCHD_LABEL.plist"
+
+  # Two installs on one host must not have OVERLAPPING prefixes. Reaping
+  # matches with startswith(), so the default "ephem-" also matches
+  # "ephem-s1-..." — a default install beside slot installs silently destroys
+  # their running VMs at every startup, which presents as CI jobs dying for no
+  # reason rather than as a misconfiguration. Equal prefixes are the same bug.
+  #
+  # Every install records its CONFIG_DIR in its own plist, so the other
+  # installs on this host are discoverable; read each one's prefix and refuse
+  # before writing anything.
+  local _other_plist _other_cfg _other_prefix
+  for _other_plist in "$HOME/Library/LaunchAgents/"*.plist; do
+    [[ -r "$_other_plist" ]] || continue
+    [[ "$_other_plist" == "$PLIST_PATH" ]] && continue
+    grep -q '<key>CONFIG_DIR</key>' "$_other_plist" 2>/dev/null || continue
+    _other_cfg="$(sed -n '/<key>CONFIG_DIR<\/key>/{n;s/.*<string>\(.*\)<\/string>.*/\1/p;}' "$_other_plist")"
+    [[ -n "$_other_cfg" && -r "$_other_cfg/config.env" ]] || continue
+    _other_prefix="$(sed -n 's/^VM_PREFIX="\(.*\)"$/\1/p' "$_other_cfg/config.env")"
+    # Installs predating VM_PREFIX used the default.
+    _other_prefix="${_other_prefix:-ephem-}"
+    if [[ "$VM_PREFIX" == "$_other_prefix"* || "$_other_prefix" == "$VM_PREFIX"* ]]; then
+      echo "ERROR: VM_PREFIX '$VM_PREFIX' overlaps '$_other_prefix', already used by" >&2
+      echo "       the install at $_other_cfg ($(basename "$_other_plist" .plist))." >&2
+      echo "       Each install reaps every VM carrying its prefix at startup, so" >&2
+      echo "       overlapping prefixes destroy each other's running jobs." >&2
+      echo "       Give this install a non-overlapping prefix, e.g. VM_PREFIX=ephem-s2-" >&2
+      exit 1
+    fi
+  done
 
   step() { printf '\n==> %s\n' "$*"; }
   gh_api() {
@@ -352,10 +399,10 @@ __main__() {
       tart clone "$SOURCE_IMAGE" "$BASE_IMAGE"
     fi
   fi
-  # The orchestrator reaps every VM whose name starts with "ephem-"; the base
-  # VM must never be eligible.
-  if [[ "$BASE_IMAGE" == ephem-* ]]; then
-    echo "ERROR: base VM name must not start with 'ephem-' (the orchestrator reaps those)" >&2
+  # The orchestrator reaps every VM carrying VM_PREFIX; the base VM must never
+  # be eligible, or the first cycle deletes the image every later cycle clones.
+  if [[ "$BASE_IMAGE" == "$VM_PREFIX"* ]]; then
+    echo "ERROR: base VM name must not start with VM_PREFIX '$VM_PREFIX' (the orchestrator reaps those)" >&2
     exit 1
   fi
 
@@ -432,6 +479,9 @@ VM_CPU_COUNT="$VM_CPU_COUNT"
 VM_DISK_GB="$VM_DISK_GB"
 HOST_RESERVE_MB="$HOST_RESERVE_MB"
 RUNNER_VERSION="$RUNNER_VERSION"
+# Namespaces this install's ephemeral VMs. Two installs on one host MUST NOT
+# share a prefix — startup reaping matches on it.
+VM_PREFIX="$VM_PREFIX"
 EOF
   chmod 600 "$CONFIG_FILE"
 
@@ -461,6 +511,10 @@ CURRENT_RUNNER_ID=""
 # below any real job, so an idle runner waiting for work never trips it: an
 # idle ephemeral runner blocks in run.sh until the broker sends something,
 # which is minutes at least, not seconds.
+# Namespaces this install's ephemeral VMs, for both naming and reaping.
+# Defaulted here as well as written by setup, so an orchestrator regenerated
+# over a config.env from before VM_PREFIX existed still starts.
+VM_PREFIX="${VM_PREFIX:-ephem-}"
 FAST_CYCLE_SECS="${FAST_CYCLE_SECS:-60}"
 # Ceiling on the progressive backoff. Long enough to stop hammering
 # generate-jitconfig through an outage, short enough that the fleet recovers
@@ -644,9 +698,15 @@ wait_for_ram_capacity() {
 }
 
 # Reap any orphans left from a setup re-run that killed us mid-job.
+#
+# Scoped to VM_PREFIX, which is what makes two installs able to share a host.
+# This runs at every orchestrator start — including a KeepAlive restart after a
+# crash and every login — so an unscoped sweep would delete the OTHER install's
+# running VM and kill the CI job on it. Each install therefore reaps only what
+# it could have created.
 reap_orphans() {
   tart list --format json 2>/dev/null \
-    | jq -r '.[]? | select(.Name | startswith("ephem-")) | .Name' \
+    | jq -r --arg p "$VM_PREFIX" '.[]? | select(.Name | startswith($p)) | .Name' \
     | while read -r orphan; do
         [ -n "$orphan" ] && cleanup_vm "$orphan"
       done
@@ -665,10 +725,10 @@ else
 fi
 # Per-VM console logs: the happy path deletes its own; failures keep theirs
 # for post-mortems. Don't let those accumulate forever.
-find "$CONFIG_DIR" -name 'vm-ephem-*.log' -mtime +7 -delete 2>/dev/null || true
+find "$CONFIG_DIR" -name "vm-${VM_PREFIX}*.log" -mtime +7 -delete 2>/dev/null || true
 # Per-cycle run captures are deleted at the end of their own cycle; any left
 # behind belong to a cycle killed mid-flight, so they are pure residue.
-find "$CONFIG_DIR" -name 'run-ephem-*.log' -delete 2>/dev/null || true
+find "$CONFIG_DIR" -name "run-${VM_PREFIX}*.log" -delete 2>/dev/null || true
 
 # Consecutive cycles that ended 0 without taking a job. A rejected runner
 # looks exactly like a healthy one that finished instantly, so this counter is
@@ -692,7 +752,7 @@ while true; do
     startup_reap_pending=0
   fi
   release_current_runner
-  vm_name="ephem-$(uuidgen | tr 'A-Z' 'a-z' | cut -c1-8)"
+  vm_name="${VM_PREFIX}$(uuidgen | tr 'A-Z' 'a-z' | cut -c1-8)"
   runner_name="$HOST_LABEL-$(date +%s)"
   log "spawning vm=$vm_name runner=$runner_name"
 
