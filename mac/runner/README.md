@@ -219,16 +219,26 @@ Current runner version: '2.335.1'
 Runner listener exit with terminated error, stop the service, no retry needed.
 ```
 
-with the real cause landing in `orchestrator.err`, not `orchestrator.log`:
-
-```
-An error occurred: Runner version v2.335.1 is deprecated and cannot receive messages.
-```
-
 Read from the GitHub UI this looks like a host problem — the runner appears,
-then goes offline seconds later. It also **hot-loops**: the runner exits `0`,
-so the orchestrator's non-zero backoff never fires and the host re-registers a
-doomed runner every ~25 s.
+then goes offline seconds later.
+
+Two things used to make this much worse, both now fixed:
+
+- **The cause was in the wrong file.** `run.sh` reports the refusal on stderr,
+  which launchd sends to `orchestrator.err` while `orchestrator.log` gets
+  stdout — so the log you tail looked fine and the sentence naming the outage
+  sat unread. The in-VM stream is now merged into `orchestrator.log`.
+- **Exit `0` read as success, so nothing backed off.** A refused runner is
+  indistinguishable by exit code from one that finished cleanly, and the host
+  re-registered a doomed runner every ~25 s — 8,245 times. The orchestrator now
+  also asks *did this runner ever get a job?* (`Running job:` in the cycle
+  output). Exit `0` + no job + faster than `FAST_CYCLE_SECS` (60) is a
+  **refusal**, not an idle runner, and backs off progressively — 30 s per
+  consecutive occurrence up to `FAST_CYCLE_MAX_BACKOFF` (300), reset by one
+  real job. Through a full deprecation that is ~17 cycles/hour instead of ~144.
+
+An idle fleet never trips this: an ephemeral runner blocks in `run.sh` waiting
+for the broker, which is minutes at minimum, not seconds.
 
 `RUNNER_VERSION` is therefore the authority, not a fallback for images with no
 runner: a baked runner that disagrees with it is replaced inside the ephemeral

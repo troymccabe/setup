@@ -456,6 +456,17 @@ source "$CONFIG_DIR/config.env"
 LEDGER="$CONFIG_DIR/pending-runners"
 CURRENT_RUNNER_ID=""
 
+# A cycle shorter than this that never took a job did not "finish early" — it
+# was refused. Chosen above a VM's boot-to-listening time (~15-25s here) and
+# below any real job, so an idle runner waiting for work never trips it: an
+# idle ephemeral runner blocks in run.sh until the broker sends something,
+# which is minutes at least, not seconds.
+FAST_CYCLE_SECS="${FAST_CYCLE_SECS:-60}"
+# Ceiling on the progressive backoff. Long enough to stop hammering
+# generate-jitconfig through an outage, short enough that the fleet recovers
+# on its own within a few minutes of the cause being fixed.
+FAST_CYCLE_MAX_BACKOFF="${FAST_CYCLE_MAX_BACKOFF:-300}"
+
 log() { printf '[%s] %s\n' "$(date +%H:%M:%S)" "$*"; }
 
 # --- registration credential -------------------------------------------
@@ -655,6 +666,14 @@ fi
 # Per-VM console logs: the happy path deletes its own; failures keep theirs
 # for post-mortems. Don't let those accumulate forever.
 find "$CONFIG_DIR" -name 'vm-ephem-*.log' -mtime +7 -delete 2>/dev/null || true
+# Per-cycle run captures are deleted at the end of their own cycle; any left
+# behind belong to a cycle killed mid-flight, so they are pure residue.
+find "$CONFIG_DIR" -name 'run-ephem-*.log' -delete 2>/dev/null || true
+
+# Consecutive cycles that ended 0 without taking a job. A rejected runner
+# looks exactly like a healthy one that finished instantly, so this counter is
+# the only thing separating "idle fleet" from "every runner is being refused".
+no_job_streak=0
 
 while true; do
   # Fetch the credential FIRST, before any VM exists, so a credential failure
@@ -876,7 +895,19 @@ while true; do
   CURRENT_RUNNER_ID="$runner_id"
   ledger_add "$runner_id"
 
-  ssh_vm "$vm_ip" "bash -s -- '$jitconfig' '${RUNNER_VERSION:-}'" <<'INVMEOF'
+  # 2>&1 is load-bearing. run.sh reports a REJECTED runner on stderr, and
+  # launchd sends orchestrator stderr to orchestrator.err — a file nobody
+  # tails, while orchestrator.log (stdout) shows a cycle that looks fine. The
+  # line that named a real outage ("Runner version v2.335.1 is deprecated and
+  # cannot receive messages") sat there unread through 8,245 cycles. Put the
+  # runner's own diagnosis in the log the operator actually reads.
+  #
+  # tee'd to a per-cycle file so the loop can ask the one question the exit
+  # code cannot answer: did this runner ever get a job? PIPESTATUS[0] keeps
+  # run.sh's status rather than tee's.
+  cycle_started="$(date +%s)"
+  cycle_out="$CONFIG_DIR/run-$vm_name.log"
+  ssh_vm "$vm_ip" "bash -s -- '$jitconfig' '${RUNNER_VERSION:-}'" 2>&1 <<'INVMEOF' | tee "$cycle_out"
 set -euo pipefail
 JITCONFIG="$1"
 RUNNER_VERSION="${2:-}"
@@ -946,15 +977,43 @@ fi
 cd ~/actions-runner
 exec ./run.sh --jitconfig "$JITCONFIG"
 INVMEOF
-  exit_code=$?
-  log "vm $vm_name runner exited (code=$exit_code)"
+  exit_code="${PIPESTATUS[0]}"
+  cycle_secs=$(( $(date +%s) - cycle_started ))
+  # "Running job:" is run.sh's own line when the broker hands it work. Its
+  # absence is what distinguishes a runner that waited and was told to stop
+  # from one that was never allowed to participate.
+  took_job=0
+  grep -q "Running job:" "$cycle_out" 2>/dev/null && took_job=1
+  rm -f "$cycle_out"
+  log "vm $vm_name runner exited (code=$exit_code, ${cycle_secs}s, took_job=$took_job)"
 
   cleanup_vm "$vm_name"
   wait "$vm_pid" 2>/dev/null || true
   if [[ "$exit_code" -ne 0 ]]; then
+    no_job_streak=0
     log "backoff 30s on non-zero exit"
     sleep 30
+  elif [[ "$took_job" == "0" && "$cycle_secs" -lt "$FAST_CYCLE_SECS" ]]; then
+    # Exit 0, no job, and far too quick to have waited for one. A runner the
+    # broker refuses lands here; so does a group or permission change that
+    # makes this runner ineligible. Both previously span at ~25s/cycle
+    # forever, because exit 0 means "clean" to the check above.
+    #
+    # Back off progressively rather than fixed: the first few may genuinely be
+    # trivial jobs, but a sustained streak is an outage, and hammering
+    # generate-jitconfig through it just buries the evidence.
+    no_job_streak=$(( no_job_streak + 1 ))
+    backoff=$(( 30 * no_job_streak ))
+    [[ "$backoff" -gt "$FAST_CYCLE_MAX_BACKOFF" ]] && backoff="$FAST_CYCLE_MAX_BACKOFF"
+    log "WARNING: runner exited 0 after ${cycle_secs}s without taking a job (${no_job_streak}x consecutively)."
+    log "         That is what a REFUSED runner looks like — not an idle one."
+    log "         Most likely a deprecated actions/runner version (bump RUNNER_VERSION"
+    log "         in $CONFIG_DIR/config.env, then reload the agent), or a runner-group"
+    log "         or permission change. The runner's own words are just above."
+    log "         backoff ${backoff}s"
+    sleep "$backoff"
   else
+    no_job_streak=0
     # Clean cycle → its console log holds nothing worth keeping. Failed
     # cycles keep theirs; the startup sweep ages those out after 7 days.
     rm -f "$CONFIG_DIR/vm-$vm_name.log"
