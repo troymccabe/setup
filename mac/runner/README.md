@@ -431,6 +431,33 @@ launchctl load   ~/Library/LaunchAgents/<label>.plist      # start
 
 ---
 
+## Tests
+
+```sh
+brew install bats-core jq shellcheck
+bats mac/runner/tests/            # 50 tests
+```
+
+`setup` converges a real Mac — it brews packages, clones multi-gigabyte VMs,
+calls the GitHub API and loads launchd agents. None of that runs in CI, and
+none of it is the interesting part. What is interesting is what the script
+**decides**: which inputs it refuses, and what it writes into `config.env`,
+`orchestrator.sh` and the plist. So the suite runs the real script against a
+sandbox `HOME` with every external command stubbed, then asserts on the
+artifacts.
+
+| File | Covers |
+|---|---|
+| `setup-validation.bats` | inputs that must be refused — `:latest`, a registry ref in `BASE_IMAGE`, a malformed `VM_PREFIX`, a non-`op://` item ref |
+| `setup-prefix-conflict.bats` | overlapping prefixes between two installs, including that the guard refuses *before writing anything* |
+| `setup-generate.bats` | the generated `config.env` / `orchestrator.sh` / plist — including that the op-read model never persists the PAT |
+| `orchestrator.bats` | the orchestrator's own decisions, by sourcing it: cycle classification, reap scoping, the pending-runner ledger, credential resolution |
+
+Two things make this possible, and both are load-bearing:
+
+- **The orchestrator guards its executable tail** (`if [[ "${BASH_SOURCE[0]}" != "${0}" ]]; then return 0; fi`), so sourcing it loads decisions without starting a runner loop. launchd always *executes* it, so the guard is inert in production.
+- **The orchestrator and the in-VM script are extracted and shellchecked separately.** They are generated from quoted heredocs, so shellcheck never sees them in the source file — to it they are data. CI fails if either extracts empty, because an extraction pattern that silently matches nothing reports success while checking nothing.
+
 ## Adding hosts & scaling
 
 Run the script on each new Mac with a distinct `HOST_LABEL`. Same `GH_ORG` +

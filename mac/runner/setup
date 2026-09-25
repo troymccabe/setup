@@ -501,7 +501,7 @@ set -uo pipefail
 
 # Resolve config dir from env (set by launchd) or default.
 CONFIG_DIR="${CONFIG_DIR:-$HOME/.gha-runner}"
-# shellcheck disable=SC1090
+# shellcheck disable=SC1090,SC1091  # generated at install time; not in the repo
 source "$CONFIG_DIR/config.env"
 LEDGER="$CONFIG_DIR/pending-runners"
 CURRENT_RUNNER_ID=""
@@ -697,6 +697,38 @@ wait_for_ram_capacity() {
   done
 }
 
+# Classify a finished cycle, and say how long to wait before the next one.
+#
+# Pure on purpose — no side effects, no clock, no tart — so the backoff policy
+# is testable without booting a VM (tests/orchestrator.bats). The loop below
+# supplies the measurements; this decides what they mean.
+#
+#   $1 exit code  $2 took_job (0|1)  $3 duration seconds  $4 current streak
+#   prints: "<class> <backoff_seconds> <new_streak>"
+#
+# The class that matters is `refused`. A runner the broker turns away exits 0
+# having done nothing, which is indistinguishable by exit code from a clean
+# finish — so exit status alone cannot brake, and the host spins. Exit 0 plus
+# no job plus faster than any real job is the signature.
+classify_cycle() {
+  local rc="$1" took_job="$2" secs="$3" streak="$4" backoff
+  if [[ "$rc" -ne 0 ]]; then
+    printf 'failed 30 0\n'
+    return 0
+  fi
+  if [[ "$took_job" == "0" && "$secs" -lt "$FAST_CYCLE_SECS" ]]; then
+    # Progressive, not fixed: one or two may be genuinely trivial jobs, but a
+    # sustained streak is an outage and hammering the API through it buries
+    # the evidence under its own output.
+    streak=$(( streak + 1 ))
+    backoff=$(( 30 * streak ))
+    [[ "$backoff" -gt "$FAST_CYCLE_MAX_BACKOFF" ]] && backoff="$FAST_CYCLE_MAX_BACKOFF"
+    printf 'refused %s %s\n' "$backoff" "$streak"
+    return 0
+  fi
+  printf 'clean 0 0\n'
+}
+
 # Reap any orphans left from a setup re-run that killed us mid-job.
 #
 # Scoped to VM_PREFIX, which is what makes two installs able to share a host.
@@ -711,6 +743,15 @@ reap_orphans() {
         [ -n "$orphan" ] && cleanup_vm "$orphan"
       done
 }
+
+# Everything above is a definition; everything below acts. Sourcing the
+# orchestrator therefore loads its decisions without starting a runner loop,
+# which is what makes them testable (tests/orchestrator.bats). launchd always
+# EXECUTES this file, so the guard is inert in production.
+if [[ "${BASH_SOURCE[0]}" != "${0}" ]]; then
+  return 0
+fi
+
 reap_orphans
 # Startup reaping calls the GitHub API, so it needs a credential too. Best
 # effort: if it can't be resolved (1Password down at boot), skip the reap
@@ -752,6 +793,7 @@ while true; do
     startup_reap_pending=0
   fi
   release_current_runner
+  # shellcheck disable=SC2018,SC2019  # uuidgen output is ASCII hex by definition
   vm_name="${VM_PREFIX}$(uuidgen | tr 'A-Z' 'a-z' | cut -c1-8)"
   runner_name="$HOST_LABEL-$(date +%s)"
   log "spawning vm=$vm_name runner=$runner_name"
@@ -828,6 +870,7 @@ while true; do
   # otherwise land in the parsed output.
   vm_xcode=""; vm_macos_major=""; probe_ok=0
   for probe_attempt in 1 2 3; do
+    # shellcheck disable=SC2016  # expands in the GUEST, not here
     probe="$(ssh_vm "$vm_ip" 'source ~/.zprofile >/dev/null 2>&1 || true; x="$(xcodebuild -version 2>/dev/null | sed -n "1s/^Xcode //p")"; m="$(sw_vers -productVersion 2>/dev/null | cut -d. -f1)"; printf "%s\n%s\n" "$x" "$m"' 2>/dev/null || true)"
     vm_xcode="$(printf '%s\n' "$probe" | sed -n 1p | tr -d '[:space:]')"
     vm_macos_major="$(printf '%s\n' "$probe" | sed -n 2p | tr -d '[:space:]')"
@@ -1049,35 +1092,29 @@ INVMEOF
 
   cleanup_vm "$vm_name"
   wait "$vm_pid" 2>/dev/null || true
-  if [[ "$exit_code" -ne 0 ]]; then
-    no_job_streak=0
-    log "backoff 30s on non-zero exit"
-    sleep 30
-  elif [[ "$took_job" == "0" && "$cycle_secs" -lt "$FAST_CYCLE_SECS" ]]; then
-    # Exit 0, no job, and far too quick to have waited for one. A runner the
-    # broker refuses lands here; so does a group or permission change that
-    # makes this runner ineligible. Both previously span at ~25s/cycle
-    # forever, because exit 0 means "clean" to the check above.
-    #
-    # Back off progressively rather than fixed: the first few may genuinely be
-    # trivial jobs, but a sustained streak is an outage, and hammering
-    # generate-jitconfig through it just buries the evidence.
-    no_job_streak=$(( no_job_streak + 1 ))
-    backoff=$(( 30 * no_job_streak ))
-    [[ "$backoff" -gt "$FAST_CYCLE_MAX_BACKOFF" ]] && backoff="$FAST_CYCLE_MAX_BACKOFF"
-    log "WARNING: runner exited 0 after ${cycle_secs}s without taking a job (${no_job_streak}x consecutively)."
-    log "         That is what a REFUSED runner looks like — not an idle one."
-    log "         Most likely a deprecated actions/runner version (bump RUNNER_VERSION"
-    log "         in $CONFIG_DIR/config.env, then reload the agent), or a runner-group"
-    log "         or permission change. The runner's own words are just above."
-    log "         backoff ${backoff}s"
-    sleep "$backoff"
-  else
-    no_job_streak=0
-    # Clean cycle → its console log holds nothing worth keeping. Failed
-    # cycles keep theirs; the startup sweep ages those out after 7 days.
-    rm -f "$CONFIG_DIR/vm-$vm_name.log"
-  fi
+  read -r cycle_class cycle_backoff no_job_streak \
+    < <(classify_cycle "$exit_code" "$took_job" "$cycle_secs" "$no_job_streak")
+
+  case "$cycle_class" in
+    failed)
+      log "backoff ${cycle_backoff}s on non-zero exit"
+      sleep "$cycle_backoff"
+      ;;
+    refused)
+      log "WARNING: runner exited 0 after ${cycle_secs}s without taking a job (${no_job_streak}x consecutively)."
+      log "         That is what a REFUSED runner looks like — not an idle one."
+      log "         Most likely a deprecated actions/runner version (bump RUNNER_VERSION"
+      log "         in $CONFIG_DIR/config.env, then reload the agent), or a runner-group"
+      log "         or permission change. The runner's own words are just above."
+      log "         backoff ${cycle_backoff}s"
+      sleep "$cycle_backoff"
+      ;;
+    *)
+      # Clean cycle → its console log holds nothing worth keeping. Failed
+      # cycles keep theirs; the startup sweep ages those out after 7 days.
+      rm -f "$CONFIG_DIR/vm-$vm_name.log"
+      ;;
+  esac
 done
 ORCHESTRATOR_EOF
   chmod +x "$ORCH_SCRIPT"
