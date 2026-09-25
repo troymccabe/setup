@@ -2,6 +2,11 @@ name: Update SHA256SUMS
 
 on:
   push:
+    # Branch-scoped deliberately. A tag push also matches `push`, and GitHub
+    # ignores `paths` for tags — so every tag ran this job, checked out a
+    # detached HEAD, and died on `git push` with "You are not currently on a
+    # branch". Tags carry no new content for this job to hash anyway.
+    branches: [main]
     paths:
       - "mac/dev/Brewfile"
       - "mac/dev/setup"
