@@ -202,8 +202,63 @@ Consequences:
   (or a new `BASE_IMAGE`). The old base VM is left in place; delete it after
   the first green cycle: `tart delete <old-base>`.
 - Images that bake `~/actions-runner` (e.g. purpose-built CI images) skip the
-  per-job runner download entirely; otherwise the pinned `RUNNER_VERSION` is
-  installed.
+  per-job runner download **only while the baked version matches
+  `RUNNER_VERSION`**. When it doesn't, the orchestrator replaces it in the VM
+  before starting the runner — see [A baked runner
+  ages](#a-baked-runner-ages-runner_version-is-authoritative).
+
+### A baked runner ages — `RUNNER_VERSION` is authoritative
+
+GitHub retires old `actions/runner` releases. A retired one is refused at the
+broker **after** JIT registration has already succeeded:
+
+```
+√ Connected to GitHub
+Current runner version: '2.335.1'
+2026-09-25 00:57:43Z: Listening for Jobs
+Runner listener exit with terminated error, stop the service, no retry needed.
+```
+
+Read from the GitHub UI this looks like a host problem — the runner appears,
+then goes offline seconds later.
+
+Two things used to make this much worse, both now fixed:
+
+- **The cause was in the wrong file.** `run.sh` reports the refusal on stderr,
+  which launchd sends to `orchestrator.err` while `orchestrator.log` gets
+  stdout — so the log you tail looked fine and the sentence naming the outage
+  sat unread. The in-VM stream is now merged into `orchestrator.log`.
+- **Exit `0` read as success, so nothing backed off.** A refused runner is
+  indistinguishable by exit code from one that finished cleanly, and the host
+  re-registered a doomed runner every ~25 s — 8,245 times. The orchestrator now
+  also asks *did this runner ever get a job?* (`Running job:` in the cycle
+  output). Exit `0` + no job + faster than `FAST_CYCLE_SECS` (60) is a
+  **refusal**, not an idle runner, and backs off progressively — 30 s per
+  consecutive occurrence up to `FAST_CYCLE_MAX_BACKOFF` (300), reset by one
+  real job. Through a full deprecation that is ~17 cycles/hour instead of ~144.
+
+An idle fleet never trips this: an ephemeral runner blocks in `run.sh` waiting
+for the broker, which is minutes at minimum, not seconds.
+
+`RUNNER_VERSION` is therefore the authority, not a fallback for images with no
+runner: a baked runner that disagrees with it is replaced inside the ephemeral
+VM before `run.sh` starts. Fixing a deprecation is a config bump plus an agent
+restart — no image rebuild:
+
+```sh
+# on the runner host
+sed -i '' 's/^RUNNER_VERSION=.*/RUNNER_VERSION="2.337.0"/' ~/.gha-runner/config.env
+launchctl unload ~/Library/LaunchAgents/<label>.plist
+launchctl load   ~/Library/LaunchAgents/<label>.plist
+```
+
+This cost two separate diagnoses before it was fixed (`v2.334.0`, then
+`v2.335.1`), because `RUNNER_VERSION` *looked* like the knob for it and was
+silently inert on any image that baked a runner.
+
+**The replacement costs a ~60 MB download per job VM.** To get that back, bake
+the current runner into the image and keep `RUNNER_VERSION` matching it — then
+the check is a no-op and nothing is downloaded.
 
 ### `du` lies about clones — use `diskutil`
 
@@ -306,7 +361,7 @@ Set via environment variables at run time (defaults shown):
 | `SOURCE_IMAGE` | `ghcr.io/cirruslabs/macos-tahoe-xcode:26.5` | Remote image, fetched once. Pinned tag required — `:latest` refused |
 | `BASE_IMAGE` | *derived*: `base-<image>-<tag>` | Existing **local** Tart VM to use instead of pulling `SOURCE_IMAGE` |
 | `REGISTRY_USER` / `REGISTRY_PAT` | `""` | `tart login` credentials for a private `SOURCE_IMAGE` registry |
-| `RUNNER_VERSION` | `2.335.1` | actions/runner installed in VMs whose image doesn't bake one |
+| `RUNNER_VERSION` | `2.337.0` | actions/runner version every VM runs. **Authoritative** — a runner baked into the image is replaced when it disagrees. Bump when GitHub deprecates a release |
 | `VM_MEMORY_MB` / `VM_CPU_COUNT` | `10240` / `4` | Per-VM sizing |
 | `VM_DISK_GB` | `""` (keep image's disk) | Applied only when it would **grow** the disk — Tart cannot shrink one |
 | `HOST_RESERVE_MB` | `6144` | RAM kept free for the host; gates concurrency |
