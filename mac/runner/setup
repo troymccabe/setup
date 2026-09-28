@@ -90,6 +90,16 @@
 #                   before booting. Auto-scales to host
 #                   capacity: 16 GB host serialises,
 #                   64 GB host fits 5+ concurrent VMs.
+#   VM_PREFIX       Name prefix for this install's         [ephem-]
+#                   ephemeral VMs. The orchestrator REAPS
+#                   every VM carrying its prefix at
+#                   startup, so two installs sharing one
+#                   host MUST use different prefixes or
+#                   each will destroy the other's running
+#                   job. Give every extra install on a
+#                   host its own (e.g. ephem-s1-,
+#                   ephem-s2-) alongside its own
+#                   LAUNCHD_LABEL and CONFIG_DIR.
 #   LAUNCHD_LABEL   launchd job label                     [dev.<lowercased-GH_ORG>.gha-runner]
 #   CONFIG_DIR      Where to stash config + scripts       [~/.gha-runner]
 #
@@ -201,12 +211,49 @@ __main__() {
   VM_CPU_COUNT="${VM_CPU_COUNT:-4}"
   VM_DISK_GB="${VM_DISK_GB:-}"
   HOST_RESERVE_MB="${HOST_RESERVE_MB:-6144}"
+  VM_PREFIX="${VM_PREFIX:-ephem-}"
+  # The prefix is spliced into VM names and matched with startswith() when
+  # reaping, so anything outside this set either cannot name a VM or would
+  # widen the reap beyond this install.
+  if [[ ! "$VM_PREFIX" =~ ^[a-z0-9][a-z0-9-]*-$ ]]; then
+    echo "ERROR: VM_PREFIX must be lowercase alphanumeric/dashes ending in '-' (got: $VM_PREFIX)" >&2
+    exit 1
+  fi
   LAUNCHD_LABEL="${LAUNCHD_LABEL:-dev.$ORG_LOWER.gha-runner}"
   CONFIG_DIR="${CONFIG_DIR:-$HOME/.gha-runner}"
 
   local CONFIG_FILE="$CONFIG_DIR/config.env"
   local ORCH_SCRIPT="$CONFIG_DIR/orchestrator.sh"
   local PLIST_PATH="$HOME/Library/LaunchAgents/$LAUNCHD_LABEL.plist"
+
+  # Two installs on one host must not have OVERLAPPING prefixes. Reaping
+  # matches with startswith(), so the default "ephem-" also matches
+  # "ephem-s1-..." — a default install beside slot installs silently destroys
+  # their running VMs at every startup, which presents as CI jobs dying for no
+  # reason rather than as a misconfiguration. Equal prefixes are the same bug.
+  #
+  # Every install records its CONFIG_DIR in its own plist, so the other
+  # installs on this host are discoverable; read each one's prefix and refuse
+  # before writing anything.
+  local _other_plist _other_cfg _other_prefix
+  for _other_plist in "$HOME/Library/LaunchAgents/"*.plist; do
+    [[ -r "$_other_plist" ]] || continue
+    [[ "$_other_plist" == "$PLIST_PATH" ]] && continue
+    grep -q '<key>CONFIG_DIR</key>' "$_other_plist" 2>/dev/null || continue
+    _other_cfg="$(sed -n '/<key>CONFIG_DIR<\/key>/{n;s/.*<string>\(.*\)<\/string>.*/\1/p;}' "$_other_plist")"
+    [[ -n "$_other_cfg" && -r "$_other_cfg/config.env" ]] || continue
+    _other_prefix="$(sed -n 's/^VM_PREFIX="\(.*\)"$/\1/p' "$_other_cfg/config.env")"
+    # Installs predating VM_PREFIX used the default.
+    _other_prefix="${_other_prefix:-ephem-}"
+    if [[ "$VM_PREFIX" == "$_other_prefix"* || "$_other_prefix" == "$VM_PREFIX"* ]]; then
+      echo "ERROR: VM_PREFIX '$VM_PREFIX' overlaps '$_other_prefix', already used by" >&2
+      echo "       the install at $_other_cfg ($(basename "$_other_plist" .plist))." >&2
+      echo "       Each install reaps every VM carrying its prefix at startup, so" >&2
+      echo "       overlapping prefixes destroy each other's running jobs." >&2
+      echo "       Give this install a non-overlapping prefix, e.g. VM_PREFIX=ephem-s2-" >&2
+      exit 1
+    fi
+  done
 
   step() { printf '\n==> %s\n' "$*"; }
   gh_api() {
@@ -352,10 +399,10 @@ __main__() {
       tart clone "$SOURCE_IMAGE" "$BASE_IMAGE"
     fi
   fi
-  # The orchestrator reaps every VM whose name starts with "ephem-"; the base
-  # VM must never be eligible.
-  if [[ "$BASE_IMAGE" == ephem-* ]]; then
-    echo "ERROR: base VM name must not start with 'ephem-' (the orchestrator reaps those)" >&2
+  # The orchestrator reaps every VM carrying VM_PREFIX; the base VM must never
+  # be eligible, or the first cycle deletes the image every later cycle clones.
+  if [[ "$BASE_IMAGE" == "$VM_PREFIX"* ]]; then
+    echo "ERROR: base VM name must not start with VM_PREFIX '$VM_PREFIX' (the orchestrator reaps those)" >&2
     exit 1
   fi
 
@@ -432,6 +479,9 @@ VM_CPU_COUNT="$VM_CPU_COUNT"
 VM_DISK_GB="$VM_DISK_GB"
 HOST_RESERVE_MB="$HOST_RESERVE_MB"
 RUNNER_VERSION="$RUNNER_VERSION"
+# Namespaces this install's ephemeral VMs. Two installs on one host MUST NOT
+# share a prefix — startup reaping matches on it.
+VM_PREFIX="$VM_PREFIX"
 EOF
   chmod 600 "$CONFIG_FILE"
 
@@ -451,7 +501,7 @@ set -uo pipefail
 
 # Resolve config dir from env (set by launchd) or default.
 CONFIG_DIR="${CONFIG_DIR:-$HOME/.gha-runner}"
-# shellcheck disable=SC1090
+# shellcheck disable=SC1090,SC1091  # generated at install time; not in the repo
 source "$CONFIG_DIR/config.env"
 LEDGER="$CONFIG_DIR/pending-runners"
 CURRENT_RUNNER_ID=""
@@ -461,6 +511,10 @@ CURRENT_RUNNER_ID=""
 # below any real job, so an idle runner waiting for work never trips it: an
 # idle ephemeral runner blocks in run.sh until the broker sends something,
 # which is minutes at least, not seconds.
+# Namespaces this install's ephemeral VMs, for both naming and reaping.
+# Defaulted here as well as written by setup, so an orchestrator regenerated
+# over a config.env from before VM_PREFIX existed still starts.
+VM_PREFIX="${VM_PREFIX:-ephem-}"
 FAST_CYCLE_SECS="${FAST_CYCLE_SECS:-60}"
 # Ceiling on the progressive backoff. Long enough to stop hammering
 # generate-jitconfig through an outage, short enough that the fleet recovers
@@ -643,14 +697,61 @@ wait_for_ram_capacity() {
   done
 }
 
+# Classify a finished cycle, and say how long to wait before the next one.
+#
+# Pure on purpose — no side effects, no clock, no tart — so the backoff policy
+# is testable without booting a VM (tests/orchestrator.bats). The loop below
+# supplies the measurements; this decides what they mean.
+#
+#   $1 exit code  $2 took_job (0|1)  $3 duration seconds  $4 current streak
+#   prints: "<class> <backoff_seconds> <new_streak>"
+#
+# The class that matters is `refused`. A runner the broker turns away exits 0
+# having done nothing, which is indistinguishable by exit code from a clean
+# finish — so exit status alone cannot brake, and the host spins. Exit 0 plus
+# no job plus faster than any real job is the signature.
+classify_cycle() {
+  local rc="$1" took_job="$2" secs="$3" streak="$4" backoff
+  if [[ "$rc" -ne 0 ]]; then
+    printf 'failed 30 0\n'
+    return 0
+  fi
+  if [[ "$took_job" == "0" && "$secs" -lt "$FAST_CYCLE_SECS" ]]; then
+    # Progressive, not fixed: one or two may be genuinely trivial jobs, but a
+    # sustained streak is an outage and hammering the API through it buries
+    # the evidence under its own output.
+    streak=$(( streak + 1 ))
+    backoff=$(( 30 * streak ))
+    [[ "$backoff" -gt "$FAST_CYCLE_MAX_BACKOFF" ]] && backoff="$FAST_CYCLE_MAX_BACKOFF"
+    printf 'refused %s %s\n' "$backoff" "$streak"
+    return 0
+  fi
+  printf 'clean 0 0\n'
+}
+
 # Reap any orphans left from a setup re-run that killed us mid-job.
+#
+# Scoped to VM_PREFIX, which is what makes two installs able to share a host.
+# This runs at every orchestrator start — including a KeepAlive restart after a
+# crash and every login — so an unscoped sweep would delete the OTHER install's
+# running VM and kill the CI job on it. Each install therefore reaps only what
+# it could have created.
 reap_orphans() {
   tart list --format json 2>/dev/null \
-    | jq -r '.[]? | select(.Name | startswith("ephem-")) | .Name' \
+    | jq -r --arg p "$VM_PREFIX" '.[]? | select(.Name | startswith($p)) | .Name' \
     | while read -r orphan; do
         [ -n "$orphan" ] && cleanup_vm "$orphan"
       done
 }
+
+# Everything above is a definition; everything below acts. Sourcing the
+# orchestrator therefore loads its decisions without starting a runner loop,
+# which is what makes them testable (tests/orchestrator.bats). launchd always
+# EXECUTES this file, so the guard is inert in production.
+if [[ "${BASH_SOURCE[0]}" != "${0}" ]]; then
+  return 0
+fi
+
 reap_orphans
 # Startup reaping calls the GitHub API, so it needs a credential too. Best
 # effort: if it can't be resolved (1Password down at boot), skip the reap
@@ -665,10 +766,10 @@ else
 fi
 # Per-VM console logs: the happy path deletes its own; failures keep theirs
 # for post-mortems. Don't let those accumulate forever.
-find "$CONFIG_DIR" -name 'vm-ephem-*.log' -mtime +7 -delete 2>/dev/null || true
+find "$CONFIG_DIR" -name "vm-${VM_PREFIX}*.log" -mtime +7 -delete 2>/dev/null || true
 # Per-cycle run captures are deleted at the end of their own cycle; any left
 # behind belong to a cycle killed mid-flight, so they are pure residue.
-find "$CONFIG_DIR" -name 'run-ephem-*.log' -delete 2>/dev/null || true
+find "$CONFIG_DIR" -name "run-${VM_PREFIX}*.log" -delete 2>/dev/null || true
 
 # Consecutive cycles that ended 0 without taking a job. A rejected runner
 # looks exactly like a healthy one that finished instantly, so this counter is
@@ -692,7 +793,8 @@ while true; do
     startup_reap_pending=0
   fi
   release_current_runner
-  vm_name="ephem-$(uuidgen | tr 'A-Z' 'a-z' | cut -c1-8)"
+  # shellcheck disable=SC2018,SC2019  # uuidgen output is ASCII hex by definition
+  vm_name="${VM_PREFIX}$(uuidgen | tr 'A-Z' 'a-z' | cut -c1-8)"
   runner_name="$HOST_LABEL-$(date +%s)"
   log "spawning vm=$vm_name runner=$runner_name"
 
@@ -768,6 +870,7 @@ while true; do
   # otherwise land in the parsed output.
   vm_xcode=""; vm_macos_major=""; probe_ok=0
   for probe_attempt in 1 2 3; do
+    # shellcheck disable=SC2016  # expands in the GUEST, not here
     probe="$(ssh_vm "$vm_ip" 'source ~/.zprofile >/dev/null 2>&1 || true; x="$(xcodebuild -version 2>/dev/null | sed -n "1s/^Xcode //p")"; m="$(sw_vers -productVersion 2>/dev/null | cut -d. -f1)"; printf "%s\n%s\n" "$x" "$m"' 2>/dev/null || true)"
     vm_xcode="$(printf '%s\n' "$probe" | sed -n 1p | tr -d '[:space:]')"
     vm_macos_major="$(printf '%s\n' "$probe" | sed -n 2p | tr -d '[:space:]')"
@@ -989,35 +1092,29 @@ INVMEOF
 
   cleanup_vm "$vm_name"
   wait "$vm_pid" 2>/dev/null || true
-  if [[ "$exit_code" -ne 0 ]]; then
-    no_job_streak=0
-    log "backoff 30s on non-zero exit"
-    sleep 30
-  elif [[ "$took_job" == "0" && "$cycle_secs" -lt "$FAST_CYCLE_SECS" ]]; then
-    # Exit 0, no job, and far too quick to have waited for one. A runner the
-    # broker refuses lands here; so does a group or permission change that
-    # makes this runner ineligible. Both previously span at ~25s/cycle
-    # forever, because exit 0 means "clean" to the check above.
-    #
-    # Back off progressively rather than fixed: the first few may genuinely be
-    # trivial jobs, but a sustained streak is an outage, and hammering
-    # generate-jitconfig through it just buries the evidence.
-    no_job_streak=$(( no_job_streak + 1 ))
-    backoff=$(( 30 * no_job_streak ))
-    [[ "$backoff" -gt "$FAST_CYCLE_MAX_BACKOFF" ]] && backoff="$FAST_CYCLE_MAX_BACKOFF"
-    log "WARNING: runner exited 0 after ${cycle_secs}s without taking a job (${no_job_streak}x consecutively)."
-    log "         That is what a REFUSED runner looks like — not an idle one."
-    log "         Most likely a deprecated actions/runner version (bump RUNNER_VERSION"
-    log "         in $CONFIG_DIR/config.env, then reload the agent), or a runner-group"
-    log "         or permission change. The runner's own words are just above."
-    log "         backoff ${backoff}s"
-    sleep "$backoff"
-  else
-    no_job_streak=0
-    # Clean cycle → its console log holds nothing worth keeping. Failed
-    # cycles keep theirs; the startup sweep ages those out after 7 days.
-    rm -f "$CONFIG_DIR/vm-$vm_name.log"
-  fi
+  read -r cycle_class cycle_backoff no_job_streak \
+    < <(classify_cycle "$exit_code" "$took_job" "$cycle_secs" "$no_job_streak")
+
+  case "$cycle_class" in
+    failed)
+      log "backoff ${cycle_backoff}s on non-zero exit"
+      sleep "$cycle_backoff"
+      ;;
+    refused)
+      log "WARNING: runner exited 0 after ${cycle_secs}s without taking a job (${no_job_streak}x consecutively)."
+      log "         That is what a REFUSED runner looks like — not an idle one."
+      log "         Most likely a deprecated actions/runner version (bump RUNNER_VERSION"
+      log "         in $CONFIG_DIR/config.env, then reload the agent), or a runner-group"
+      log "         or permission change. The runner's own words are just above."
+      log "         backoff ${cycle_backoff}s"
+      sleep "$cycle_backoff"
+      ;;
+    *)
+      # Clean cycle → its console log holds nothing worth keeping. Failed
+      # cycles keep theirs; the startup sweep ages those out after 7 days.
+      rm -f "$CONFIG_DIR/vm-$vm_name.log"
+      ;;
+  esac
 done
 ORCHESTRATOR_EOF
   chmod +x "$ORCH_SCRIPT"

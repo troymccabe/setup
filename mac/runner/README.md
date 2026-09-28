@@ -365,6 +365,7 @@ Set via environment variables at run time (defaults shown):
 | `VM_MEMORY_MB` / `VM_CPU_COUNT` | `10240` / `4` | Per-VM sizing |
 | `VM_DISK_GB` | `""` (keep image's disk) | Applied only when it would **grow** the disk — Tart cannot shrink one |
 | `HOST_RESERVE_MB` | `6144` | RAM kept free for the host; gates concurrency |
+| `VM_PREFIX` | `ephem-` | Name prefix for this install's ephemeral VMs. Each install **reaps every VM carrying its prefix** at startup, so two installs on one host need non-overlapping prefixes — see [Two installs on one host](#two-installs-on-one-host) |
 | `LAUNCHD_LABEL` | `dev.<org>.gha-runner` | launchd job label |
 | `CONFIG_DIR` | `~/.gha-runner` | Config + scripts location |
 
@@ -374,6 +375,32 @@ to `VM_MEMORY_MB=12288 HOST_RESERVE_MB=4096 VM_CPU_COUNT=6` — and trial the
 heaviest job once before advertising its capability label via `EXTRA_LABELS`.
 
 ---
+
+## Two installs on one host
+
+Each install is a self-contained orchestrator loop, so a host can run more than
+one — that is how `SLOTS`-style concurrency works. Three things must differ:
+
+```sh
+LAUNCHD_LABEL=dev.myorg.gha-runner-s1 CONFIG_DIR=~/.gha-runner/s1 VM_PREFIX=ephem-s1- ...
+LAUNCHD_LABEL=dev.myorg.gha-runner-s2 CONFIG_DIR=~/.gha-runner/s2 VM_PREFIX=ephem-s2- ...
+```
+
+`VM_PREFIX` is the one that is not merely tidiness. Every orchestrator reaps
+the VMs carrying its prefix **at startup** — which happens on a KeepAlive
+restart after a crash, and at every login, not just on install. An install that
+reaps a VM it did not create destroys a CI job mid-run, and the job's only
+symptom is a runner that vanished.
+
+Prefixes must not **overlap**, not merely differ: matching is `startswith`, so
+the default `ephem-` also matches `ephem-s1-…`. Pairing a default install with
+`ephem-s1-` is the same bug as sharing a prefix. The installer refuses to
+proceed when it finds an overlapping prefix on the host — it discovers the
+other installs through their plists, which record their `CONFIG_DIR`.
+
+Concurrency is still gated by RAM: each loop waits for
+`VM_MEMORY_MB + HOST_RESERVE_MB` to be free, so a 16 GB host serialises two
+installs naturally while a 64 GB host runs them side by side.
 
 ## Surviving reboots
 
@@ -403,6 +430,33 @@ launchctl load   ~/Library/LaunchAgents/<label>.plist      # start
 ```
 
 ---
+
+## Tests
+
+```sh
+brew install bats-core jq shellcheck
+bats mac/runner/tests/            # 50 tests
+```
+
+`setup` converges a real Mac — it brews packages, clones multi-gigabyte VMs,
+calls the GitHub API and loads launchd agents. None of that runs in CI, and
+none of it is the interesting part. What is interesting is what the script
+**decides**: which inputs it refuses, and what it writes into `config.env`,
+`orchestrator.sh` and the plist. So the suite runs the real script against a
+sandbox `HOME` with every external command stubbed, then asserts on the
+artifacts.
+
+| File | Covers |
+|---|---|
+| `setup-validation.bats` | inputs that must be refused — `:latest`, a registry ref in `BASE_IMAGE`, a malformed `VM_PREFIX`, a non-`op://` item ref |
+| `setup-prefix-conflict.bats` | overlapping prefixes between two installs, including that the guard refuses *before writing anything* |
+| `setup-generate.bats` | the generated `config.env` / `orchestrator.sh` / plist — including that the op-read model never persists the PAT |
+| `orchestrator.bats` | the orchestrator's own decisions, by sourcing it: cycle classification, reap scoping, the pending-runner ledger, credential resolution |
+
+Two things make this possible, and both are load-bearing:
+
+- **The orchestrator guards its executable tail** (`if [[ "${BASH_SOURCE[0]}" != "${0}" ]]; then return 0; fi`), so sourcing it loads decisions without starting a runner loop. launchd always *executes* it, so the guard is inert in production.
+- **The orchestrator and the in-VM script are extracted and shellchecked separately.** They are generated from quoted heredocs, so shellcheck never sees them in the source file — to it they are data. CI fails if either extracts empty, because an extraction pattern that silently matches nothing reports success while checking nothing.
 
 ## Adding hosts & scaling
 

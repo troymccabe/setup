@@ -1,0 +1,49 @@
+name: mac/runner CI
+
+on:
+  pull_request:
+    paths: ['mac/runner/**', '.github/workflows/mac-runner-ci.yml']
+  push:
+    branches: [main]
+    paths: ['mac/runner/**', '.github/workflows/mac-runner-ci.yml']
+
+jobs:
+  shellcheck:
+    name: shellcheck
+    # macOS only, deliberately: this installer refuses to run anywhere but
+    # Apple Silicon, so that is the only platform whose behaviour matters.
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: brew install shellcheck
+      - name: shellcheck the installer and its test harness
+        run: shellcheck mac/runner/setup mac/runner/tests/helper.bash
+
+      # The orchestrator and the in-VM script are generated from heredocs, so
+      # shellcheck never sees them in the source file — a quoted heredoc is
+      # data. Extract and check them as the separate programs they become.
+      - name: shellcheck the GENERATED orchestrator and in-VM script
+        run: |
+          # Match the heredoc opener anywhere on the line, NOT anchored to the
+          # end: the in-VM opener carries a trailing `| tee ...`, and an
+          # anchored pattern silently extracted an empty file instead.
+          awk '/<<.ORCHESTRATOR_EOF./{f=1;next} /^ORCHESTRATOR_EOF$/{f=0} f' \
+            mac/runner/setup > /tmp/orchestrator.sh
+          awk '/<<.INVMEOF./{f=1;next} /^INVMEOF$/{f=0} f' \
+            mac/runner/setup > /tmp/in-vm.sh
+          for f in /tmp/orchestrator.sh /tmp/in-vm.sh; do
+            [ -s "$f" ] || { echo "::error::$f extracted empty — the heredoc opener moved; fix the awk pattern"; exit 1; }
+            bash -n "$f"
+            # -s bash: the in-VM script has no shebang by design — it is piped
+            # to `bash -s` inside the guest, so the dialect is stated here.
+            shellcheck -s bash "$f"
+          done
+
+  bats:
+    name: bats
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: brew install bats-core jq
+      - name: run test suite
+        run: bats mac/runner/tests/
