@@ -402,22 +402,43 @@ Concurrency is still gated by RAM: each loop waits for
 `VM_MEMORY_MB + HOST_RESERVE_MB` to be free, so a 16 GB host serialises two
 installs naturally while a 64 GB host runs them side by side.
 
-## Surviving reboots
+## Surviving reboots and power cuts
+
+`setup` configures the host's power behaviour itself — it boots again after a
+power failure (`pmset autorestart`) and never sleeps. This used to be a manual
+checklist here, and on **2026-10-20** a power cut proved a checklist
+insufficient: the fleet's only macOS host stayed dark, its runners
+deregistered with it, and the dependent repo's macOS CI stalled ~4.5 h with
+the whole PR queue behind it.
+
+Nothing is written blind. `pmset` accepts a key the machine doesn't support and
+silently ignores it — only a *misspelled* key errors — so each key is gated on
+`pmset -g cap` (the documented support probe) and read back from `-g custom`
+afterwards. Watch the `Configuring host power behaviour` output: any line
+starting with `!` means that part did **not** take. The usual causes are no
+passwordless sudo (the command to run by hand is printed) or a machine without
+the feature — `autorestart` exists on desktops but not on portables.
+
+### The one manual step
 
 The orchestrator installs as a **launchd agent**, which loads only inside a
 logged-in GUI (Aqua) session — **not** at the login window. A LaunchDaemon
 won't help: Tart uses `Virtualization.framework`, which needs a GUI session, so
 it can't run pre-login.
 
-For an unattended runner, configure the host to log in automatically on boot:
+So auto-boot only restores CI if the host also **logs in by itself**:
 
 - System Settings ▸ Users & Groups ▸ **Automatically log in as** ▸ `<user>`
   (requires **FileVault off** — it blocks auto-login)
-- `sudo pmset -a sleep 0 displaysleep 0 autorestart 1`
-- System Settings ▸ Energy ▸ **Start up automatically after a power failure**
 
-With auto-login on: reboot → login → agent loads → orchestrator starts. Without
-it, someone must log in once after each reboot.
+`setup` **reports** whether this is on but deliberately doesn't set it: it
+weakens host security (no FileVault, a console left logged in unattended), so
+it stays the operator's call — the same reasoning that keeps
+[`mac/keepawake`](../keepawake) opt-in.
+
+With it on: power returns → boot → login → agent loads → orchestrator starts.
+Without it, the Mac boots to a login window and someone must log in before any
+job runs.
 
 ---
 
