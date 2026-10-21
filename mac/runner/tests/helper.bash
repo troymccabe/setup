@@ -85,7 +85,84 @@ mr_stub_all() {
   mr_stub sw_vers 'echo 26.0'
   mr_stub df 'echo "Filesystem 1G-blocks Used Avail Capacity"; echo "/dev/disk1 500 100 400 20%"'
   mr_stub hostname 'echo test-host'
+
+  # Power configuration. These MUST be stubbed: the installer calls
+  # `sudo -n pmset -a ...` for real, and a CI runner with passwordless sudo
+  # would have its own sleep settings rewritten by the test suite — exactly
+  # the host mutation this harness promises not to do.
+  #
+  # The default machine is a DESKTOP: `-g cap` advertises autorestart, and a
+  # write is honoured, so the happy path reads back clean. Tests override with
+  # mr_pmset_cap / mr_pmset_custom / mr_pmset_unapplied.
+  mr_pmset_cap 'displaysleep
+disksleep
+sleep
+womp
+autorestart'
+  # `-g custom` is seeded with stock PRE-install values, because a real Mac
+  # always reports these keys — it never omits one just because it was not set.
+  # That makes the installer's two negative outcomes distinguishable: a key
+  # reported with the OLD value (write ignored) versus a key not reported at
+  # all (unverifiable). Seeding empty would conflate them.
+  mr_pmset_custom 'AC Power:
+ displaysleep         10
+ disksleep            10
+ sleep                10
+ autorestart          0'
+  mr_stub sudo '
+    printf "%s\n" "$*" >> "$MR_SANDBOX/state/sudo.calls"
+    [ "${STUB_SUDO_DENIED:-0}" = "1" ] && exit 1
+    # Drop sudo-only flags and run the rest through the stub PATH.
+    while [ $# -gt 0 ]; do case "$1" in -n|-H|-E) shift ;; *) break ;; esac; done
+    exec "$@"'
+  mr_stub defaults '
+    printf "%s\n" "$*" >> "$MR_SANDBOX/state/defaults.calls"
+    case "$*" in
+      *autoLoginUser*) cat "$MR_SANDBOX/state/autologin.txt" 2>/dev/null \
+                         || { echo "does not exist" >&2; exit 1; } ;;
+    esac
+    exit 0'
+  mr_stub pmset '
+    printf "%s\n" "$*" >> "$MR_SANDBOX/state/pmset.calls"
+    case "$*" in
+      "-g cap")    cat "$MR_SANDBOX/state/pmset-cap.txt" ;;
+      "-g custom") cat "$MR_SANDBOX/state/pmset-custom.txt" 2>/dev/null || true ;;
+      -a*)         # Model a machine that HONOURS the write by appending the
+                   # new values. Appending (rather than rewriting the old line)
+                   # is enough: the installer only ever asks whether a given
+                   # key+value pair is present, never which line came first.
+                   [ "${STUB_PMSET_UNAPPLIED:-0}" = "1" ] && exit 0
+                   shift
+                   while [ $# -ge 2 ]; do
+                     # STUB_PMSET_UNREPORTED models a key pmset ACCEPTS but
+                     # `-g custom` never surfaces, so the write is real and
+                     # still unconfirmable.
+                     case " ${STUB_PMSET_UNREPORTED:-} " in
+                       *" $1 "*) ;;
+                       *) printf " %s %s\n" "$1" "$2" \
+                            >> "$MR_SANDBOX/state/pmset-custom.txt" ;;
+                     esac
+                     shift 2
+                   done ;;
+    esac
+    exit 0'
 }
+
+# Stage the machine capabilities `pmset -g cap` reports (one key per line).
+mr_pmset_cap() { printf '%s\n' "$1" > "$MR_SANDBOX/state/pmset-cap.txt"; }
+
+# Stage the settings `pmset -g custom` reports before the installer writes.
+mr_pmset_custom() { printf '%s\n' "$1" > "$MR_SANDBOX/state/pmset-custom.txt"; }
+
+# Auto-login state the installer probes. Stubbed rather than read from the
+# real machine so the assertion does not depend on whose Mac runs the suite.
+# Default: OFF, which is the stock macOS state (the key does not exist).
+mr_autologin_on()  { printf 'ci-runner\n' > "$MR_SANDBOX/state/autologin.txt"; }
+mr_autologin_off() { rm -f "$MR_SANDBOX/state/autologin.txt"; }
+
+# Model a machine that ACCEPTS a pmset write and ignores it — the failure mode
+# the installer's read-back exists to catch.
+mr_pmset_unapplied() { export STUB_PMSET_UNAPPLIED=1; }
 
 mr_tart_vms()  { printf '%s' "$1" > "$MR_SANDBOX/state/tart-list.json"; }
 mr_groups()    { printf '%s' "$1" > "$MR_SANDBOX/state/groups.json"; }

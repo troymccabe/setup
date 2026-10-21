@@ -144,19 +144,27 @@
 # the second pass, the orchestrator + plist are overwritten with the same
 # content, the launchd service is cycled.
 #
-# Surviving reboots:
-#   This installs a LaunchAgent, which loads only inside a logged-in GUI
-#   (Aqua) session — NOT at the login window. A LaunchDaemon won't help:
-#   Tart uses Virtualization.framework, which needs a GUI session, so it
-#   can't run pre-login. For an unattended runner, configure the host to
-#   log in automatically on boot:
+# Surviving reboots and power cuts:
+#   The installer configures the host's power behaviour itself — it boots
+#   again after a power failure (pmset autorestart, where the machine
+#   supports it) and never sleeps. That used to be advice in this comment,
+#   and on 2026-10-20 a power cut proved advice insufficient: the fleet's
+#   only macOS host stayed dark, its runners deregistered, and the dependent
+#   repo's macOS CI stalled ~4.5h. See "Host power behaviour" in __main__.
+#
+#   ONE manual step remains, and the fix is incomplete without it. This
+#   installs a LaunchAgent, which loads only inside a logged-in GUI (Aqua)
+#   session — NOT at the login window. A LaunchDaemon won't help: Tart uses
+#   Virtualization.framework, which needs a GUI session, so it can't run
+#   pre-login. So an unattended host must also log in by itself:
 #     • System Settings ▸ Users & Groups ▸ "Automatically log in as" ▸ <user>
 #       (requires FileVault OFF — it blocks auto-login).
-#     • sudo pmset -a sleep 0 displaysleep 0   # don't let the host sleep
-#     • System Settings ▸ Energy ▸ "Start up automatically after a power
-#       failure" (or: sudo pmset -a autorestart 1).
-#   With auto-login on: reboot → login → LaunchAgent loads → orchestrator
-#   starts. Without it, someone must log in once after each reboot.
+#   The installer REPORTS whether this is on but deliberately does not set
+#   it: it weakens host security (no FileVault, console left logged in), so
+#   it stays the operator's call — same reasoning that keeps mac/keepawake
+#   opt-in. With it on: power returns → boot → login → LaunchAgent loads →
+#   orchestrator starts. Without it, the Mac boots to a login window and
+#   someone must log in before any job runs.
 #
 # Scaling beyond one host:
 #   This is a single-host design — each Mac runs its own launchd loop and
@@ -1120,6 +1128,109 @@ ORCHESTRATOR_EOF
   chmod +x "$ORCH_SCRIPT"
 
   # -----------------------------------------------------------------------
+  # Host power behaviour — come back by itself after a power cut
+  # -----------------------------------------------------------------------
+  # 2026-10-20: a power cut took down the only macOS host in this fleet. Power
+  # came back; the Mac did not. Its ephemeral runners had deregistered with it,
+  # so the dependent repo's macOS CI stalled ~4.5h and the entire PR queue
+  # blocked behind one dark Mac mini — the GUI XCUITest suite runs nowhere
+  # else. Both settings below were already in this file as manual steps (see
+  # "Surviving reboots" in the header); a checklist nobody re-runs is precisely
+  # what failed, so the installer applies them instead of advising them.
+  #
+  # pmset's exit status is NOT proof a setting took. Measured on macOS
+  # 26.5.1/arm64: only a MISSPELLED key prints the usage error — a real key the
+  # machine does not support parses fine and reaches the same root check as a
+  # supported one, so writing one is indistinguishable from success. `pmset -g
+  # cap` is the documented probe ("displays which power management features the
+  # machine supports"), so gate on that and read the values back afterwards.
+  step "Configuring host power behaviour"
+
+  PM_CAP="$(pmset -g cap 2>/dev/null || true)"
+  pm_supported() { printf '%s\n' "$PM_CAP" | grep -qw "$1"; }
+
+  # Accumulated as a STRING, not an array: this runs under whatever
+  # `/usr/bin/env bash` resolves to, and on a stock Mac that is bash 3.2, where
+  # expanding an EMPTY array under `set -u` is a fatal unbound-variable error.
+  # Every token is a bare pmset key or number, so splitting it is safe.
+  PM_ARGS=""
+
+  # Never sleep — a sleeping host stops taking jobs while still holding its
+  # registration, which from GitHub's side is indistinguishable from a wedged
+  # runner rather than an idle one.
+  for _pm_opt in sleep displaysleep disksleep; do
+    if pm_supported "$_pm_opt"; then
+      PM_ARGS="$PM_ARGS $_pm_opt 0"
+    else
+      echo "  ! '$_pm_opt' absent from 'pmset -g cap' — skipped"
+    fi
+  done
+
+  # Boot when power returns: the half that was missing on 2026-10-20. This one
+  # is capability-gated rather than universal — present on desktops (which a
+  # Mac mini runner is), absent on portables (verified: not in -g cap on an
+  # Apple Silicon laptop) — so probe for it rather than assume from the model.
+  if pm_supported autorestart; then
+    PM_ARGS="$PM_ARGS autorestart 1"
+  else
+    echo "  ! 'autorestart' absent from 'pmset -g cap' — NOT set."
+    echo "    A power cut will leave this host down until someone presses the"
+    echo "    power button. Expected on a portable; on a desktop, check"
+    echo "    System Settings ▸ Energy."
+  fi
+
+  if [[ -n "${PM_ARGS// /}" ]]; then
+    # Passwordless sudo only — this script is meant to be curl|sh-able, so it
+    # must never block on a password prompt. Same idiom as mac/keepawake.
+    # shellcheck disable=SC2086  # deliberate word-splitting; see PM_ARGS above
+    if sudo -n pmset -a $PM_ARGS 2>/dev/null; then
+      echo "  applied: pmset -a$PM_ARGS"
+    else
+      echo "  ! pmset needs sudo and none was cached — run once:"
+      echo "      sudo pmset -a$PM_ARGS"
+    fi
+    # Read the values back. The exit status above cannot tell "applied" from
+    # "accepted and silently ignored", and the no-sudo branch applied nothing
+    # at all — so confirm against what the machine actually reports.
+    PM_NOW="$(pmset -g custom 2>/dev/null || true)"
+    ( # subshell: `set --` must not clobber __main__'s own positionals
+      # shellcheck disable=SC2086  # same deliberate splitting as above
+      set -- $PM_ARGS
+      while [[ $# -ge 2 ]]; do
+        if printf '%s\n' "$PM_NOW" \
+            | grep -qE "^[[:space:]]*$1[[:space:]]+$2([[:space:]]|\$)"; then
+          echo "      $1=$2 ✓"
+        elif printf '%s\n' "$PM_NOW" | grep -qE "^[[:space:]]*$1[[:space:]]"; then
+          # Reported with a DIFFERENT value: the write did not stick.
+          echo "      ! $1 did not read back as $2 — not in effect"
+        else
+          # Not reported at all, so this cannot be confirmed either way. Kept
+          # distinct from the branch above on purpose: "I cannot tell" must not
+          # print as "it is wrong", and must not print as a ✓ either.
+          echo "      ? $1 not reported by 'pmset -g custom' — unverified"
+        fi
+        shift 2
+      done
+    )
+  fi
+
+  # autorestart only restores CI if the Mac also LOGS IN by itself: the
+  # orchestrator is a LaunchAgent (next section) and loads in an Aqua session,
+  # never at the login window. Auto-login is deliberately NOT enabled here — it
+  # requires FileVault off and leaves a console logged in unattended, which is
+  # the operator's trade-off to make, not an installer's. Report it, so a
+  # half-fix is visible now rather than discovered during the next outage.
+  if [[ -n "$(defaults read /Library/Preferences/com.apple.loginwindow \
+      autoLoginUser 2>/dev/null || true)" ]]; then
+    echo "  auto-login is ON ✓ — a reboot reaches the LaunchAgent unattended"
+  else
+    echo "  ! auto-login is OFF: this host will boot after a power cut and then"
+    echo "    sit at the login window with NO runner. Enable it in System"
+    echo "    Settings ▸ Users & Groups ▸ 'Automatically log in as' (requires"
+    echo "    FileVault off), or accept a manual login after each outage."
+  fi
+
+  # -----------------------------------------------------------------------
   # launchd
   # -----------------------------------------------------------------------
   step "Installing launchd service ($LAUNCHD_LABEL)"
@@ -1184,14 +1295,21 @@ Service:
   • Stop:       launchctl unload $PLIST_PATH
   • Restart:    launchctl unload $PLIST_PATH && launchctl load $PLIST_PATH
 
-Surviving reboots:
-  This is a LaunchAgent — it starts on GUI login, not at the login window
-  (Tart needs a GUI session, so a LaunchDaemon won't work). For an
-  unattended host, enable auto-login so it starts itself after a reboot:
+Surviving reboots and power cuts:
+  Power behaviour is configured above — this host boots again after a power
+  failure and never sleeps. Check the "Configuring host power behaviour"
+  output: any line starting with "!" means that part did NOT take (usually
+  no passwordless sudo, or the machine lacks the feature).
+
+  The remaining step is manual, and the fix is incomplete without it. This
+  is a LaunchAgent — it starts on GUI login, not at the login window (Tart
+  needs a GUI session, so a LaunchDaemon won't work), so an unattended host
+  must log in by itself:
     • System Settings ▸ Users & Groups ▸ Automatically log in as ▸ <user>
       (requires FileVault OFF)
-    • sudo pmset -a sleep 0 displaysleep 0 autorestart 1
-  Without auto-login, log in once after each reboot to start the runner.
+  Not set here on purpose — it weakens host security, so it is your call.
+  Without it this Mac boots after an outage and waits at the login window
+  with no runner.
 
 GitHub:
   • Each job spawns a fresh runner with labels:
