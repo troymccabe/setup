@@ -10,9 +10,10 @@
 # pmset cannot deliver. `pmset` accepts a key the machine does not support and
 # silently ignores it (measured: only a misspelled key errors), so a naive
 # install would print success and leave the host exactly as dark as before.
-# These tests pin the three ways that goes wrong: unsupported feature, no
-# sudo, and a write that is accepted and ignored. Each must be VISIBLE, and
-# none may fail the install.
+# These tests pin the four ways that goes wrong — an unsupported feature, no
+# passwordless sudo, a write accepted and ignored, and a write that cannot be
+# confirmed either way — plus the half-fix where the host boots but never logs
+# in. Each must be VISIBLE and distinct, and none may fail the install.
 
 load helper
 
