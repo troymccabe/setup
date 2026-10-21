@@ -63,6 +63,27 @@ autorestart'
     echo "read-back did not notice an ignored write: $output"; return 1; }
 }
 
+@test "a key the machine does not report reads as UNVERIFIED, not as wrong or ✓" {
+  # `-g cap` advertises autorestart and pmset accepts the write, but
+  # `-g custom` never surfaces the key — so the write may well have worked and
+  # simply cannot be confirmed. That is a third outcome: calling it "not in
+  # effect" invents a failure, calling it ✓ invents a success.
+  mr_pmset_custom 'AC Power:
+ displaysleep         10
+ disksleep            10
+ sleep                10'
+  export STUB_PMSET_UNREPORTED="autorestart"
+  converged || return 1
+  echo "$output" | grep -qE '\? *autorestart not reported' || {
+    echo "no unverified state for an unreported key: $output"; return 1; }
+  echo "$output" | grep -q 'autorestart did not read back' && {
+    echo "reported an unverifiable key as wrong"; return 1; }
+  echo "$output" | grep -q 'autorestart=1 ✓' && {
+    echo "claimed an unverifiable key as confirmed"; return 1; }
+  # The keys that ARE reported still confirm normally.
+  echo "$output" | grep -q 'sleep=0 ✓' || { echo "lost the verifiable keys"; return 1; }
+}
+
 @test "no passwordless sudo: never blocks, surfaces the command, still converges" {
   export STUB_SUDO_DENIED=1
   converged || return 1

@@ -1200,8 +1200,14 @@ ORCHESTRATOR_EOF
         if printf '%s\n' "$PM_NOW" \
             | grep -qE "^[[:space:]]*$1[[:space:]]+$2([[:space:]]|\$)"; then
           echo "      $1=$2 ✓"
-        else
+        elif printf '%s\n' "$PM_NOW" | grep -qE "^[[:space:]]*$1[[:space:]]"; then
+          # Reported with a DIFFERENT value: the write did not stick.
           echo "      ! $1 did not read back as $2 — not in effect"
+        else
+          # Not reported at all, so this cannot be confirmed either way. Kept
+          # distinct from the branch above on purpose: "I cannot tell" must not
+          # print as "it is wrong", and must not print as a ✓ either.
+          echo "      ? $1 not reported by 'pmset -g custom' — unverified"
         fi
         shift 2
       done

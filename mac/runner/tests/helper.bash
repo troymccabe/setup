@@ -91,14 +91,24 @@ mr_stub_all() {
   # would have its own sleep settings rewritten by the test suite — exactly
   # the host mutation this harness promises not to do.
   #
-  # The default machine is a DESKTOP: `-g cap` advertises autorestart, and
-  # `-g custom` reports whatever the script asked for, so the happy path reads
-  # back clean. Tests override with mr_pmset_cap / mr_pmset_unapplied.
+  # The default machine is a DESKTOP: `-g cap` advertises autorestart, and a
+  # write is honoured, so the happy path reads back clean. Tests override with
+  # mr_pmset_cap / mr_pmset_custom / mr_pmset_unapplied.
   mr_pmset_cap 'displaysleep
 disksleep
 sleep
 womp
 autorestart'
+  # `-g custom` is seeded with stock PRE-install values, because a real Mac
+  # always reports these keys — it never omits one just because it was not set.
+  # That makes the installer's two negative outcomes distinguishable: a key
+  # reported with the OLD value (write ignored) versus a key not reported at
+  # all (unverifiable). Seeding empty would conflate them.
+  mr_pmset_custom 'AC Power:
+ displaysleep         10
+ disksleep            10
+ sleep                10
+ autorestart          0'
   mr_stub sudo '
     printf "%s\n" "$*" >> "$MR_SANDBOX/state/sudo.calls"
     [ "${STUB_SUDO_DENIED:-0}" = "1" ] && exit 1
@@ -117,13 +127,21 @@ autorestart'
     case "$*" in
       "-g cap")    cat "$MR_SANDBOX/state/pmset-cap.txt" ;;
       "-g custom") cat "$MR_SANDBOX/state/pmset-custom.txt" 2>/dev/null || true ;;
-      -a*)         # Record the applied values so `-g custom` can echo them
-                   # back, modelling a machine that honours the write.
+      -a*)         # Model a machine that HONOURS the write by appending the
+                   # new values. Appending (rather than rewriting the old line)
+                   # is enough: the installer only ever asks whether a given
+                   # key+value pair is present, never which line came first.
                    [ "${STUB_PMSET_UNAPPLIED:-0}" = "1" ] && exit 0
                    shift
                    while [ $# -ge 2 ]; do
-                     printf " %s %s\n" "$1" "$2" \
-                       >> "$MR_SANDBOX/state/pmset-custom.txt"
+                     # STUB_PMSET_UNREPORTED models a key pmset ACCEPTS but
+                     # `-g custom` never surfaces, so the write is real and
+                     # still unconfirmable.
+                     case " ${STUB_PMSET_UNREPORTED:-} " in
+                       *" $1 "*) ;;
+                       *) printf " %s %s\n" "$1" "$2" \
+                            >> "$MR_SANDBOX/state/pmset-custom.txt" ;;
+                     esac
                      shift 2
                    done ;;
     esac
@@ -132,6 +150,9 @@ autorestart'
 
 # Stage the machine capabilities `pmset -g cap` reports (one key per line).
 mr_pmset_cap() { printf '%s\n' "$1" > "$MR_SANDBOX/state/pmset-cap.txt"; }
+
+# Stage the settings `pmset -g custom` reports before the installer writes.
+mr_pmset_custom() { printf '%s\n' "$1" > "$MR_SANDBOX/state/pmset-custom.txt"; }
 
 # Auto-login state the installer probes. Stubbed rather than read from the
 # real machine so the assertion does not depend on whose Mac runs the suite.
